@@ -114,6 +114,7 @@ from vllm.multimodal.processing.processor import (
     PromptUpdate,
     PromptUpdateDetails,
 )
+from vllm.multimodal.utils import set_mm_embedding_modality
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.processor import cached_processor_from_config
 
@@ -136,6 +137,14 @@ except (ImportError, ModuleNotFoundError):
     flash_attn = None
 
 logger = init_logger(__name__)
+
+_THINKER_ARCHITECTURE = "Qwen3OmniMoeThinkerForConditionalGeneration"
+
+
+def _ensure_thinker_architecture(config: PretrainedConfig) -> None:
+    """Give the nested Thinker config the architecture required by MoE LoRA."""
+    if not config.architectures:
+        config.architectures = [_THINKER_ARCHITECTURE]
 
 
 class Qwen3Omni_VisionTransformer(_Qwen3Omni_VisionTransformer):
@@ -1121,6 +1130,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
     Qwen3OmniMoeConditionalGenerationMixin,
     SupportsTranscription,
 ):
+    # PEFT stores the expert LoRA matrices with an explicit expert dimension.
+    is_3d_moe_weight: bool = True
+
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             "thinker.lm_head.": "language_model.lm_head.",
@@ -1164,6 +1176,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self.vllm_config = vllm_config  # needed for torch compile forward context
         hf_config = vllm_config.model_config.hf_config
         thinker_config: Qwen3OmniMoeThinkerConfig = getattr(hf_config, "thinker_config", None) or hf_config
+        _ensure_thinker_architecture(thinker_config)
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
         self.config = thinker_config
@@ -1408,6 +1421,13 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                     visual_dim = embeddings.shape[-1] // (multiscale_len + 1)
                     multi_dim = visual_dim * multiscale_len
                     embeddings_main, embeddings_multiscale = torch.split(embeddings, [visual_dim, multi_dim], dim=-1)
+                    # torch.split returns fresh views, so the `modality` tag the
+                    # encoder gather attached (gpu_model_runner._gather_mm_embeddings)
+                    # does not survive. merge_interleaved_embeddings groups by that
+                    # tag since vLLM #46213, so carry it across the split.
+                    modality = getattr(embeddings, "modality", None)
+                    if modality is not None:
+                        set_mm_embedding_modality(embeddings_main, modality)
                     multimodal_embeddings[index] = embeddings_main
                     multimodal_embeddings_multiscale.append(embeddings_multiscale)
                     if not is_interleaved:
@@ -1445,8 +1465,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 is_video,
                 is_audio,
                 is_mm_device,
-                num_video,
-                num_audio,
             )
 
         # Default: standard merge (no interleaving), same as parent class.

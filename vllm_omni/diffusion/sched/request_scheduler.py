@@ -3,30 +3,79 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
 from typing import TYPE_CHECKING
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched.base_scheduler import _BaseScheduler, get_request_batch_sampling_params_key
+from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
+    RequestBatchSamplingParamsKey,
+    _AdmissionWaitDecision,
 )
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.utils import RunnerOutput
 
+# LoRA identity is derived from `sampling.lora_request`, not a same-named field
+# on sampling params, so it must be resolved separately from the bulk lookup.
+_REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(
+    field.name for field in fields(RequestBatchSamplingParamsKey)
+) - {"lora_int_id"}
 
-class RequestScheduler(_BaseScheduler):
-    """Diffusion scheduler with vLLM-style waiting/running queues."""
 
-    def _build_sampling_params_key(self, request: OmniDiffusionRequest):
-        return get_request_batch_sampling_params_key(request)
+def build_request_batch_sampling_params_key(request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
+    """Build the compatibility key shared by scheduling and DP dispatch."""
+    sampling = request.sampling_params
+    # LoRA identity is optional on sampling params (and on test stubs).
+    lora_request = getattr(sampling, "lora_request", None)
+    key_kwargs = {name: getattr(sampling, name) for name in _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES}
+    key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
+    return RequestBatchSamplingParamsKey(**key_kwargs)
 
-    def add_request(self, request: OmniDiffusionRequest) -> str:
-        return super().add_request(request)
 
-    def schedule(self) -> DiffusionSchedulerOutput:
-        return super().schedule()
+class RequestScheduler(BaseScheduler):
+    """Scheduler for static request waves, including admission coalescing."""
+
+    def get_admission_wait_decision(
+        self,
+        *,
+        now: float,
+        dp_concurrent: bool = False,
+    ) -> _AdmissionWaitDecision:
+        assert self.od_config is not None
+        max_wait_ms = self.od_config.request_batch_max_wait_ms
+        if max_wait_ms <= 0.0 or self.max_num_running_reqs <= 1:
+            return _AdmissionWaitDecision(should_wait=False)
+        if self.num_running_requests() > 0:
+            return _AdmissionWaitDecision(should_wait=False)
+
+        max_wait_s = max_wait_ms / 1000.0
+        stable_window_s = min(0.3, max_wait_s / 2.0) if dp_concurrent else min(0.05, max_wait_s / 5.0)
+        return _AdmissionWaitDecision(
+            should_wait=True,
+            deadline=now + max_wait_s,
+            stable_window_s=stable_window_s,
+            max_batch=self.max_num_running_reqs,
+        )
+
+    def should_end_admission_wait(
+        self,
+        decision: _AdmissionWaitDecision,
+        *,
+        now: float,
+        stable_since: float,
+    ) -> bool:
+        waiting = self.num_waiting_requests()
+        return (
+            waiting >= decision.max_batch
+            or (waiting > 0 and now - stable_since >= decision.stable_window_s)
+            or (decision.deadline is not None and now >= decision.deadline)
+        )
+
+    def _build_sampling_params_key(self, request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
+        return build_request_batch_sampling_params_key(request)
 
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
         scheduled_request_ids = sched_output.scheduled_request_ids
@@ -42,8 +91,14 @@ class RequestScheduler(_BaseScheduler):
             req_output = output.get_request_output(request_id)
             result = req_output.result if req_output is not None else None
             if result is None:
-                terminal_statuses[request_id] = DiffusionRequestStatus.FINISHED_ERROR
-                terminal_errors[request_id] = "No output result"
+                # Async mode: result=None with async_output_id means compute done,
+                # final output will arrive later via wait_output_ready.
+                if req_output is not None and req_output.async_output_id is not None:
+                    terminal_statuses[request_id] = DiffusionRequestStatus.FINISHED_COMPLETED
+                    terminal_errors[request_id] = None
+                else:
+                    terminal_statuses[request_id] = DiffusionRequestStatus.FINISHED_ERROR
+                    terminal_errors[request_id] = "No output result"
             elif result.aborted:
                 terminal_statuses[request_id] = DiffusionRequestStatus.FINISHED_ABORTED
                 terminal_errors[request_id] = None
