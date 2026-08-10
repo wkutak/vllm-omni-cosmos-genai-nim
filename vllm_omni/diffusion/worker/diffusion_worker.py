@@ -65,6 +65,42 @@ logger = init_logger(__name__)
 
 _ASYNC_OUTPUT_THREAD_JOIN_TIMEOUT_S = 10.0
 
+# Budget for a single MessageQueue.dequeue() in the worker busy loop.
+# `dequeue` spends this budget on both the shared-memory ring buffer and the
+# ZMQ overflow socket that carries payloads too large for the ring buffer.
+# The ring-buffer slot is already consumed once the overflow marker is read,
+# so a timeout that fires mid-transfer drops the request while the socket
+# payload stays queued, desynchronizing every later dequeue. Multi-GB V2V
+# broadcasts need far more than the 1s this used to allow, so keep the
+# default comfortably above the worst-case transfer time.
+_DEFAULT_BROADCAST_DEQUEUE_TIMEOUT_S = 30.0
+_BROADCAST_DEQUEUE_TIMEOUT_ENV = "VLLM_OMNI_DIFFUSION_WORKER_BROADCAST_TIMEOUT_S"
+
+# Broadcast receive errors other than timeouts are logged on the first
+# occurrence and then only every N failures, so a persistent fault stays
+# visible without flooding the log from a tight loop.
+_RECV_ERROR_LOG_INTERVAL = 100
+
+
+def _broadcast_dequeue_timeout_s() -> float:
+    """Effective per-dequeue timeout for the worker broadcast queue."""
+    raw = os.environ.get(_BROADCAST_DEQUEUE_TIMEOUT_ENV)
+    if raw is None:
+        return _DEFAULT_BROADCAST_DEQUEUE_TIMEOUT_S
+    try:
+        timeout = float(raw)
+    except ValueError:
+        timeout = 0.0
+    if timeout <= 0:
+        logger.warning(
+            "Ignoring invalid %s=%r; using %.1fs",
+            _BROADCAST_DEQUEUE_TIMEOUT_ENV,
+            raw,
+            _DEFAULT_BROADCAST_DEQUEUE_TIMEOUT_S,
+        )
+        return _DEFAULT_BROADCAST_DEQUEUE_TIMEOUT_S
+    return timeout
+
 
 @dataclass
 class _DiffusionVllmModelConfig:
@@ -803,6 +839,8 @@ class WorkerProc:
         self.od_config = od_config
         self.gpu_id = gpu_id
         self.wake_event = wake_event
+        self._broadcast_timeout_s = _broadcast_dequeue_timeout_s()
+        self._recv_error_count = 0
 
         # Inter-process Communication
         self.context = zmq.Context(io_threads=2)
@@ -1065,20 +1103,50 @@ class WorkerProc:
             result["wave_id"] = wave_id
         return result, should_reply
 
+    def recv_message(self) -> Any:
+        """Receive the next broadcast message from the executor.
+
+        Raises ``TimeoutError`` when nothing arrives within the broadcast
+        timeout, which the busy loop treats as an idle tick.
+        """
+        return self.mq.dequeue(timeout=self._broadcast_timeout_s)
+
+    def _log_recv_failure(self, exc: BaseException) -> None:
+        """Report a non-timeout broadcast receive failure, throttled."""
+        self._recv_error_count += 1
+        if self._recv_error_count == 1 or self._recv_error_count % _RECV_ERROR_LOG_INTERVAL == 0:
+            logger.error(
+                "Worker %d: broadcast receive failed (%d failure(s) so far): %s",
+                self.gpu_id,
+                self._recv_error_count,
+                exc,
+                exc_info=True,
+            )
+
     def _worker_busy_loop(self) -> None:
         """Main busy loop for Multiprocessing Workers."""
-        logger.info(f"Worker {self.gpu_id} ready to receive requests via shared memory")
+        logger.info(
+            "Worker %d ready to receive requests via shared memory "
+            "(broadcast dequeue timeout: %.1fs)",
+            self.gpu_id,
+            self._broadcast_timeout_s,
+        )
 
         while self._running:
             msg = None
             try:
                 msg = self.recv_message()
-            except Exception:
+            except Exception as e:
                 if self.wake_event and self.wake_event.is_set():
                     self.wake_event.clear()
                     logger.info(f"Worker {self.gpu_id} caught OOB POKE, forcing wake-up sequence.")
                     msg = {"type": "wake_up", "task_id": "recovery-task", "tags": None}
                 else:
+                    # An idle queue is expected; anything else must not be
+                    # swallowed silently or the worker spins forever while the
+                    # caller waits on a reply that never comes.
+                    if not isinstance(e, TimeoutError):
+                        self._log_recv_failure(e)
                     continue
             if msg is None:
                 continue
