@@ -12,8 +12,11 @@ from vllm_omni.diffusion.models.cosmos3 import mixed_precision
 from vllm_omni.diffusion.models.cosmos3.mixed_precision import (
     Cosmos3MixedPrecisionConfig,
     Cosmos3MixedPrecisionRuntime,
+    Cosmos3PrecisionLayerState,
     Fp8W8A8W8A16Strategy,
     _Cosmos3MixedPrecisionLinearMethod,
+    _CpuW8A16BlockWeightProvider,
+    _GpuW8A16BlockWeightProvider,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -26,11 +29,13 @@ def test_config_parses_asymmetric_schedule_and_reasoner_policy() -> None:
             "cosmos3_mixed_precision_first_steps": 2,
             "cosmos3_mixed_precision_last_steps": 4,
             "cosmos3_mixed_precision_reasoner_policy": "base_precision",
+            "cosmos3_mixed_precision_w8a16_cache": "all",
         }
     )
 
     assert config.enabled
     assert config.reasoner_policy == "base_precision"
+    assert config.w8a16_cache == "all"
     selected = [index for index in range(10) if config.use_high_precision(index, 10)]
     assert selected == [0, 1, 6, 7, 8, 9]
 
@@ -68,11 +73,25 @@ def test_one_step_engine_execution_uses_base_precision() -> None:
         ({"cosmos3_mixed_precision_format": "nvfp4"}, "must be one of"),
         ({"cosmos3_mixed_precision_first_steps": -1}, "non-negative"),
         ({"cosmos3_mixed_precision_reasoner_policy": "fp16"}, "must be one of"),
+        ({"cosmos3_mixed_precision_w8a16_cache": "disk"}, "must be one of"),
     ],
 )
 def test_config_rejects_invalid_values(values: dict, message: str) -> None:
     with pytest.raises((TypeError, ValueError), match=message):
         Cosmos3MixedPrecisionConfig.from_additional_config(values)
+
+
+@pytest.mark.parametrize("cache_mode", ["gpu_block", "cpu_block"])
+def test_config_accepts_block_cache_modes(cache_mode: str) -> None:
+    config = Cosmos3MixedPrecisionConfig.from_additional_config(
+        {"cosmos3_mixed_precision_w8a16_cache": cache_mode}
+    )
+    assert config.w8a16_cache == cache_mode
+
+
+def test_config_defaults_to_bounded_gpu_block_cache() -> None:
+    config = Cosmos3MixedPrecisionConfig.from_additional_config({})
+    assert config.w8a16_cache == "gpu_block"
 
 
 class _Layer(torch.nn.Module):
@@ -138,15 +157,20 @@ def _runtime_and_method(
     *,
     path: str = "generation",
     reasoner_policy: str = "high_precision",
+    cache_mode: str = "generation",
 ):
     config = Cosmos3MixedPrecisionConfig(
         format="fp8",
         first_steps=1,
         last_steps=1,
         reasoner_policy=reasoner_policy,  # type: ignore[arg-type]
+        w8a16_cache=cache_mode,  # type: ignore[arg-type]
     )
-    strategy = Fp8W8A8W8A16Strategy()
+    strategy = Fp8W8A8W8A16Strategy(
+        cache_mode=cache_mode,  # type: ignore[arg-type]
+    )
     runtime = Cosmos3MixedPrecisionRuntime(config, strategy)
+    runtime.installed_counts[path] = 1  # type: ignore[index]
     base = _BaseMethod()
     method = _Cosmos3MixedPrecisionLinearMethod(
         base,  # type: ignore[arg-type]
@@ -174,6 +198,70 @@ def test_generation_dispatches_w8a16_edges_and_base_w8a8_middle() -> None:
     expected = torch.nn.functional.linear(x, expected_weight.t())
     assert torch.equal(edge, expected)
     assert base.apply_calls == 1
+
+
+def test_generation_cache_is_contiguous_reused_and_nonpersistent() -> None:
+    runtime, _, method, layer = _runtime_and_method()
+    assert method.state is not None
+    cache_name = method.state.cached_weight_name
+    assert cache_name is not None
+    cached_weight = getattr(layer, cache_name)
+    assert cached_weight.shape == (3, 2)
+    assert cached_weight.dtype == torch.bfloat16
+    assert cached_weight.is_contiguous()
+    assert cache_name not in layer.state_dict()
+
+    runtime.set_step(0, 3)
+    x = torch.tensor([[2.0, 4.0]], dtype=torch.bfloat16)
+    first = method.apply(layer, x)
+    second = method.apply(layer, x)
+
+    assert getattr(layer, cache_name).data_ptr() == cached_weight.data_ptr()
+    assert torch.equal(first, second)
+
+
+def test_generation_cache_avoids_redequantizing_mutated_fp8_weight() -> None:
+    cached_runtime, _, cached_method, cached_layer = _runtime_and_method()
+    uncached_runtime, _, uncached_method, uncached_layer = _runtime_and_method(
+        cache_mode="none"
+    )
+    x = torch.ones(1, 2, dtype=torch.bfloat16)
+    cached_runtime.set_step(0, 3)
+    uncached_runtime.set_step(0, 3)
+    cached_before = cached_method.apply(cached_layer, x)
+    uncached_before = uncached_method.apply(uncached_layer, x)
+
+    cached_layer.weight.data.zero_()
+    uncached_layer.weight.data.zero_()
+
+    assert torch.equal(cached_method.apply(cached_layer, x), cached_before)
+    assert not torch.equal(uncached_method.apply(uncached_layer, x), uncached_before)
+
+
+@pytest.mark.parametrize(
+    ("cache_mode", "path", "is_cached"),
+    [
+        ("none", "generation", False),
+        ("generation", "generation", True),
+        ("generation", "reasoner", False),
+        ("all", "reasoner", True),
+    ],
+)
+def test_cache_scope(cache_mode: str, path: str, is_cached: bool) -> None:
+    _, _, method, _ = _runtime_and_method(
+        cache_mode=cache_mode,
+        path=path,
+    )
+    assert method.state is not None
+    assert (method.state.cached_weight_name is not None) is is_cached
+
+
+def test_cached_weight_dtype_must_match_activations() -> None:
+    runtime, _, method, layer = _runtime_and_method()
+    runtime.set_step(0, 3)
+
+    with pytest.raises(TypeError, match="does not match activation dtype"):
+        method.apply(layer, torch.ones(1, 2, dtype=torch.float16))
 
 
 @pytest.mark.parametrize(
@@ -340,3 +428,116 @@ def test_compiled_dispatch_has_bounded_base_and_high_variants() -> None:
     compiled(x)
 
     assert 1 <= compile_count <= 2
+
+
+class _StagedLinearBlock(torch.nn.Module):
+    def __init__(self, state: Cosmos3PrecisionLayerState) -> None:
+        super().__init__()
+        self.state = state
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        assert self.state.staged_weight is not None
+        return torch.nn.functional.linear(value, self.state.staged_weight)
+
+
+def _cuda_block_provider_fixture(provider_cls):
+    states = [
+        Cosmos3PrecisionLayerState(
+            module_name=f"generation.{index}.linear",
+            path="generation",
+            input_size=2,
+            output_size=2,
+            block_index=index,
+            linear_index=0,
+        )
+        for index in range(2)
+    ]
+    source_weights = [
+        torch.tensor([[1.0, 0.0], [0.0, 1.0]], device="cuda"),
+        torch.tensor([[2.0, 0.0], [0.0, 2.0]], device="cuda"),
+    ]
+    layers = [
+        _Layer(
+            weight.to(torch.float8_e4m3fn),
+            torch.tensor([scale], device="cuda"),
+            input_size=2,
+            output_size=2,
+        ).cuda()
+        for weight, scale in zip(source_weights, (1.0, 0.5), strict=True)
+    ]
+    blocks = [_StagedLinearBlock(state).cuda() for state in states]
+    provider = provider_cls(torch.bfloat16)
+    for state, layer in zip(states, layers, strict=True):
+        provider.add(state, layer)
+    provider.install(blocks, lambda: True)
+    provider.initialize()
+    return provider, states, blocks
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "provider_cls",
+    [_GpuW8A16BlockWeightProvider, _CpuW8A16BlockWeightProvider],
+)
+def test_block_provider_double_buffers_repeated_cfg_passes(provider_cls) -> None:
+    provider, states, blocks = _cuda_block_provider_fixture(provider_cls)
+    pointers = [state.staged_weight.data_ptr() for state in states]
+    value = torch.tensor([[3.0, 4.0]], dtype=torch.bfloat16, device="cuda")
+
+    for _ in range(2):
+        actual = value
+        for block in blocks:
+            actual = block(actual)
+        assert torch.equal(actual, value)
+
+    torch.accelerator.synchronize()
+    assert [state.staged_weight.data_ptr() for state in states] == pointers
+    assert provider.device_bytes == 2 * 2 * 2 * 2
+    if provider_cls is _CpuW8A16BlockWeightProvider:
+        assert provider.host_bytes == 2 * 2 * 2 * 2
+        assert all(block.is_pinned() for block in provider._host_blocks)
+    else:
+        assert provider.host_bytes == 0
+    # Completing the last block wraps block zero for another CFG pass.
+    assert provider._loaded_block_for_slot[0] == 0
+    provider.reset()
+    if provider_cls is _CpuW8A16BlockWeightProvider:
+        assert not provider._host_blocks
+        provider.preload_first()
+        actual = value
+        for block in blocks:
+            actual = block(actual)
+        assert torch.equal(actual, value)
+        assert all(block.is_pinned() for block in provider._host_blocks)
+        provider.reset()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_block_provider_post_hook_is_exception_safe() -> None:
+    class _RaisingBlock(torch.nn.Module):
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            del value
+            raise RuntimeError("boom")
+
+    state = Cosmos3PrecisionLayerState(
+        module_name="generation.0.linear",
+        path="generation",
+        input_size=2,
+        output_size=2,
+    )
+    layer = _Layer(
+        torch.eye(2, device="cuda").to(torch.float8_e4m3fn),
+        torch.ones(1, device="cuda"),
+        input_size=2,
+        output_size=2,
+    ).cuda()
+    block = _RaisingBlock().cuda()
+    provider = _GpuW8A16BlockWeightProvider(torch.bfloat16)
+    provider.add(state, layer)
+    provider.install([block], lambda: True)
+    provider.initialize()
+
+    with pytest.raises(RuntimeError, match="boom"):
+        block(torch.ones(1, 2, device="cuda", dtype=torch.bfloat16))
+    provider.reset()
+    assert provider._slot_was_used[0]

@@ -1141,7 +1141,10 @@ class Cosmos3VFMTransformer(nn.Module):
         )
         mixed_precision_strategy = None
         if mixed_precision_config.enabled:
-            mixed_precision_strategy = create_cosmos3_precision_strategy(mixed_precision_config)
+            mixed_precision_strategy = create_cosmos3_precision_strategy(
+                mixed_precision_config,
+                activation_dtype=dtype,
+            )
             mixed_precision_strategy.validate_quant_config(quant_config)
 
         self.language_model = self._language_model_cls(
