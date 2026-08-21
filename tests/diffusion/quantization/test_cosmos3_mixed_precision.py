@@ -8,18 +8,38 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.diffusion.models.cosmos3 import mixed_precision
+from vllm_omni.diffusion.models.cosmos3 import mixed_precision as mixed_precision_api
 from vllm_omni.diffusion.models.cosmos3.mixed_precision import (
     Cosmos3MixedPrecisionConfig,
     Cosmos3MixedPrecisionRuntime,
-    Cosmos3PrecisionLayerState,
     Fp8W8A8W8A16Strategy,
-    _Cosmos3MixedPrecisionLinearMethod,
-    _CpuW8A16BlockWeightProvider,
-    _GpuW8A16BlockWeightProvider,
+)
+from vllm_omni.diffusion.models.cosmos3.mixed_precision import runtime as runtime_impl
+from vllm_omni.diffusion.models.cosmos3.mixed_precision import strategy as strategy_impl
+from vllm_omni.diffusion.models.cosmos3.mixed_precision.block_cache import (
+    Cosmos3PrecisionLayerState,
+    CpuW8A16BlockWeightProvider,
+    GpuW8A16BlockWeightProvider,
+)
+from vllm_omni.diffusion.models.cosmos3.mixed_precision.runtime import (
+    Cosmos3MixedPrecisionLinearMethod,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+def test_package_does_not_export_implementation_classes() -> None:
+    implementation_classes = {
+        "Cosmos3MixedPrecisionLinearMethod",
+        "Cosmos3PrecisionLayerState",
+        "CpuW8A16BlockWeightProvider",
+        "GpuW8A16BlockWeightProvider",
+        "W8A16BlockEntry",
+        "W8A16BlockWeightProvider",
+    }
+
+    assert implementation_classes.isdisjoint(mixed_precision_api.__all__)
+    assert all(not hasattr(mixed_precision_api, name) for name in implementation_classes)
 
 
 def test_config_parses_asymmetric_schedule_and_reasoner_policy() -> None:
@@ -83,9 +103,7 @@ def test_config_rejects_invalid_values(values: dict, message: str) -> None:
 
 @pytest.mark.parametrize("cache_mode", ["gpu_block", "cpu_block"])
 def test_config_accepts_block_cache_modes(cache_mode: str) -> None:
-    config = Cosmos3MixedPrecisionConfig.from_additional_config(
-        {"cosmos3_mixed_precision_w8a16_cache": cache_mode}
-    )
+    config = Cosmos3MixedPrecisionConfig.from_additional_config({"cosmos3_mixed_precision_w8a16_cache": cache_mode})
     assert config.w8a16_cache == cache_mode
 
 
@@ -172,7 +190,7 @@ def _runtime_and_method(
     runtime = Cosmos3MixedPrecisionRuntime(config, strategy)
     runtime.installed_counts[path] = 1  # type: ignore[index]
     base = _BaseMethod()
-    method = _Cosmos3MixedPrecisionLinearMethod(
+    method = Cosmos3MixedPrecisionLinearMethod(
         base,  # type: ignore[arg-type]
         runtime,
         f"{path}.linear",
@@ -222,9 +240,7 @@ def test_generation_cache_is_contiguous_reused_and_nonpersistent() -> None:
 
 def test_generation_cache_avoids_redequantizing_mutated_fp8_weight() -> None:
     cached_runtime, _, cached_method, cached_layer = _runtime_and_method()
-    uncached_runtime, _, uncached_method, uncached_layer = _runtime_and_method(
-        cache_mode="none"
-    )
+    uncached_runtime, _, uncached_method, uncached_layer = _runtime_and_method(cache_mode="none")
     x = torch.ones(1, 2, dtype=torch.bfloat16)
     cached_runtime.set_step(0, 3)
     uncached_runtime.set_step(0, 3)
@@ -296,7 +312,7 @@ def test_marlin_is_rejected_before_base_processing(monkeypatch) -> None:
         pass
 
     monkeypatch.setattr(
-        mixed_precision,
+        strategy_impl,
         "MarlinFP8ScaledMMLinearKernel",
         _FakeMarlin,
     )
@@ -369,7 +385,7 @@ def test_install_discovers_both_components_without_fixed_inventory(monkeypatch) 
             self.prefix = prefix
             self.quant_method = SimpleNamespace(name="fp8")
 
-    monkeypatch.setattr(mixed_precision, "LinearBase", _FakeLinear)
+    monkeypatch.setattr(runtime_impl, "LinearBase", _FakeLinear)
     strategy = Fp8W8A8W8A16Strategy()
     monkeypatch.setattr(strategy, "accepts", lambda method: getattr(method, "name", None) == "fp8")
     runtime = Cosmos3MixedPrecisionRuntime(
@@ -377,9 +393,7 @@ def test_install_discovers_both_components_without_fixed_inventory(monkeypatch) 
         strategy,
     )
     transformer = SimpleNamespace(
-        language_model=SimpleNamespace(
-            layers=torch.nn.Sequential(_FakeLinear("language_model.layers.0.q_proj"))
-        ),
+        language_model=SimpleNamespace(layers=torch.nn.Sequential(_FakeLinear("language_model.layers.0.q_proj"))),
         gen_layers=torch.nn.Sequential(
             _FakeLinear("gen_layers.0.q_proj"),
             _FakeLinear("gen_layers.0.out_proj"),
@@ -477,7 +491,7 @@ def _cuda_block_provider_fixture(provider_cls):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "provider_cls",
-    [_GpuW8A16BlockWeightProvider, _CpuW8A16BlockWeightProvider],
+    [GpuW8A16BlockWeightProvider, CpuW8A16BlockWeightProvider],
 )
 def test_block_provider_double_buffers_repeated_cfg_passes(provider_cls) -> None:
     provider, states, blocks = _cuda_block_provider_fixture(provider_cls)
@@ -493,7 +507,7 @@ def test_block_provider_double_buffers_repeated_cfg_passes(provider_cls) -> None
     torch.accelerator.synchronize()
     assert [state.staged_weight.data_ptr() for state in states] == pointers
     assert provider.device_bytes == 2 * 2 * 2 * 2
-    if provider_cls is _CpuW8A16BlockWeightProvider:
+    if provider_cls is CpuW8A16BlockWeightProvider:
         assert provider.host_bytes == 2 * 2 * 2 * 2
         assert all(block.is_pinned() for block in provider._host_blocks)
     else:
@@ -501,7 +515,7 @@ def test_block_provider_double_buffers_repeated_cfg_passes(provider_cls) -> None
     # Completing the last block wraps block zero for another CFG pass.
     assert provider._loaded_block_for_slot[0] == 0
     provider.reset()
-    if provider_cls is _CpuW8A16BlockWeightProvider:
+    if provider_cls is CpuW8A16BlockWeightProvider:
         assert not provider._host_blocks
         provider.preload_first()
         actual = value
@@ -532,7 +546,7 @@ def test_block_provider_post_hook_is_exception_safe() -> None:
         output_size=2,
     ).cuda()
     block = _RaisingBlock().cuda()
-    provider = _GpuW8A16BlockWeightProvider(torch.bfloat16)
+    provider = GpuW8A16BlockWeightProvider(torch.bfloat16)
     provider.add(state, layer)
     provider.install([block], lambda: True)
     provider.initialize()
