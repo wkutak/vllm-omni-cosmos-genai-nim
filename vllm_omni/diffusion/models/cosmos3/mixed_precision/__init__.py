@@ -53,9 +53,9 @@ Flow elements
 1. **Request policy.** Configuration describes the high-precision regions at
    the start and end of denoising, the independent reasoner policy, and the
    weight-cache policy. It contains no quantization arithmetic.
-2. **Strategy selection.** A factory selects the implementation for the loaded
-   checkpoint format. This keeps the scheduling flow reusable when another
-   format, such as NVFP4, is added.
+2. **Strategy selection.** One explicit registry selects an implementation
+   module for the loaded checkpoint format. Configuration validation and
+   factory dispatch derive from the same registry.
 3. **Model installation.** The runtime discovers eligible reasoner and
    generation linears from the instantiated model, retains their original
    quantization methods, and asks the strategy to validate their loaded tensor
@@ -108,22 +108,22 @@ remain implementation details in their respective modules.
 
 from .config import (
     Cosmos3MixedPrecisionConfig,
+    DenseWeightCacheMode,
     MixedPrecisionFormat,
     PrecisionPath,
     ReasonerPolicy,
     W8A16CacheMode,
 )
+from .registry import create_cosmos3_precision_strategy
 from .runtime import Cosmos3MixedPrecisionRuntime
-from .strategy import (
-    Cosmos3PrecisionStrategy,
-    Fp8W8A8W8A16Strategy,
-    create_cosmos3_precision_strategy,
-)
+from .strategies.fp8 import Fp8W8A8W8A16Strategy
+from .strategy import Cosmos3PrecisionStrategy
 
 __all__ = [
     "Cosmos3MixedPrecisionConfig",
     "Cosmos3MixedPrecisionRuntime",
     "Cosmos3PrecisionStrategy",
+    "DenseWeightCacheMode",
     "Fp8W8A8W8A16Strategy",
     "MixedPrecisionFormat",
     "PrecisionPath",

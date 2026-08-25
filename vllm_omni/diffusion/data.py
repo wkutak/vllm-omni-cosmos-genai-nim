@@ -41,6 +41,14 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_COSMOS3_PIPELINE_CLASSES = frozenset(
+    {
+        "Cosmos3OmniDiffusersPipeline",
+        "Cosmos3OmniPipeline",
+    }
+)
+_COSMOS3_MIXED_PRECISION_FORMAT_KEY = "cosmos3_mixed_precision_format"
+
 
 def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize legacy diffusion kwargs before config construction."""
@@ -824,7 +832,7 @@ class OmniDiffusionConfig:
     # Explicit runtime override for ModelOpt FP8 diffusion checkpoints. This
     # does not enable FP8 by itself; it only selects CUTLASS once the checkpoint
     # has already resolved to vLLM's ModelOpt FP8 linear method.
-    force_cutlass_fp8: bool = False
+    force_cutlass_fp8: bool | None = None
 
     # Diffusion attention KV cache dtype (not vLLM's --kv-cache-dtype for AR models).
     # None = native dtype (no quantization).
@@ -936,6 +944,8 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
+        if self.force_cutlass_fp8 is not None and not isinstance(self.force_cutlass_fp8, bool):
+            raise TypeError(f"force_cutlass_fp8 must be a bool or None, got {type(self.force_cutlass_fp8)!r}")
         if self.diffusion_compile_granularity not in {"regional", "full"}:
             raise ValueError(
                 "diffusion_compile_granularity must be 'regional' or 'full', "
@@ -1175,6 +1185,40 @@ class OmniDiffusionConfig:
         self.max_multimodal_image_inputs = metadata.max_multimodal_image_inputs
         self.supports_mixed_reference_inputs = metadata.supports_mixed_reference_inputs
 
+    def _apply_cosmos3_mixed_precision_defaults(self) -> None:
+        """Enable the supported mixed FP8 path for Cosmos3 checkpoints."""
+        if self.model_class_name not in _COSMOS3_PIPELINE_CLASSES:
+            return
+
+        quant_config = self.quantization_config
+        get_name = getattr(quant_config, "get_name", None)
+        is_tensorwise_modelopt_fp8 = (
+            callable(get_name)
+            and get_name() == "modelopt"
+            and bool(getattr(quant_config, "is_checkpoint_fp8_serialized", False))
+            and getattr(quant_config, "quant_method", None) == "FP8"
+        )
+        if not is_tensorwise_modelopt_fp8:
+            return
+
+        precision_format = self.additional_config.setdefault(
+            _COSMOS3_MIXED_PRECISION_FORMAT_KEY,
+            "fp8",
+        )
+        if str(precision_format).lower() == "fp8":
+            # The mixed strategy needs the canonical FP8 matrix. vLLM's
+            # default CUDA kernel order may otherwise choose Marlin and repack
+            # the weight before the strategy can use its W8A16 path.
+            if self.force_cutlass_fp8 is None:
+                logger.info("Automatically enabling CUTLASS FP8 kernels for Cosmos3 mixed W8A8/W8A16 inference.")
+                self.force_cutlass_fp8 = True
+            elif self.force_cutlass_fp8 is False:
+                logger.info(
+                    "Using native FP8 kernel selection for Cosmos3 mixed "
+                    "W8A8/W8A16 inference because force_cutlass_fp8 was "
+                    "explicitly set to False."
+                )
+
     @staticmethod
     def _looks_like_lance_subfolder(model: str | None) -> bool:
         """Return True when ``--model`` points at a Lance per-component subfolder.
@@ -1351,6 +1395,8 @@ class OmniDiffusionConfig:
                         self.model_class_name = architecture
                 else:
                     raise
+
+        self._apply_cosmos3_mixed_precision_defaults()
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":

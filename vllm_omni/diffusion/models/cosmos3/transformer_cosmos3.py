@@ -1139,6 +1139,7 @@ class Cosmos3VFMTransformer(nn.Module):
         mixed_precision_config = Cosmos3MixedPrecisionConfig.from_additional_config(
             getattr(od_config, "additional_config", None)
         )
+        self.mixed_precision_enabled = mixed_precision_config.enabled
         mixed_precision_strategy = None
         if mixed_precision_config.enabled:
             mixed_precision_strategy = create_cosmos3_precision_strategy(

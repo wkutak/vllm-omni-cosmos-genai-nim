@@ -595,7 +595,7 @@ class _DiffusionConfigProjection:
     diffusion_kv_cache_skip_step_indices: set[int] | None = None
     diffusion_kv_cache_skip_layer_indices: set[int] | None = None
     moe_backend: str = "auto"
-    force_cutlass_fp8: bool = False
+    force_cutlass_fp8: bool | None = None
     enable_diffusion_pipeline_profiler: bool = False
     step_execution: bool = False
     supports_multimodal_inputs: bool = False

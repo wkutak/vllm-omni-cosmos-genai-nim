@@ -3,26 +3,33 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+import logging
 
 import pytest
 import torch
+from vllm.model_executor.layers.quantization.modelopt import ModelOptFp8Config
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.cosmos3 import mixed_precision as mixed_precision_api
 from vllm_omni.diffusion.models.cosmos3.mixed_precision import (
     Cosmos3MixedPrecisionConfig,
     Cosmos3MixedPrecisionRuntime,
     Fp8W8A8W8A16Strategy,
+    create_cosmos3_precision_strategy,
 )
 from vllm_omni.diffusion.models.cosmos3.mixed_precision import runtime as runtime_impl
-from vllm_omni.diffusion.models.cosmos3.mixed_precision import strategy as strategy_impl
 from vllm_omni.diffusion.models.cosmos3.mixed_precision.block_cache import (
     Cosmos3PrecisionLayerState,
-    CpuW8A16BlockWeightProvider,
-    GpuW8A16BlockWeightProvider,
+    CpuBlockWeightProvider,
+    GpuBlockWeightProvider,
 )
+from vllm_omni.diffusion.models.cosmos3.mixed_precision.registry import MIXED_PRECISION_FORMATS
 from vllm_omni.diffusion.models.cosmos3.mixed_precision.runtime import (
     Cosmos3MixedPrecisionLinearMethod,
+)
+from vllm_omni.diffusion.models.cosmos3.mixed_precision.strategies import fp8 as fp8_strategy_impl
+from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+    Cosmos3OmniDiffusersPipeline,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -32,7 +39,11 @@ def test_package_does_not_export_implementation_classes() -> None:
     implementation_classes = {
         "Cosmos3MixedPrecisionLinearMethod",
         "Cosmos3PrecisionLayerState",
+        "CpuBlockWeightProvider",
         "CpuW8A16BlockWeightProvider",
+        "DenseBlockEntry",
+        "DenseBlockWeightProvider",
+        "GpuBlockWeightProvider",
         "GpuW8A16BlockWeightProvider",
         "W8A16BlockEntry",
         "W8A16BlockWeightProvider",
@@ -40,6 +51,22 @@ def test_package_does_not_export_implementation_classes() -> None:
 
     assert implementation_classes.isdisjoint(mixed_precision_api.__all__)
     assert all(not hasattr(mixed_precision_api, name) for name in implementation_classes)
+
+
+def test_registered_formats_drive_config_validation_and_factory() -> None:
+    assert MIXED_PRECISION_FORMATS == {"none", "fp8"}
+
+    config = Cosmos3MixedPrecisionConfig.from_additional_config({"cosmos3_mixed_precision_format": "fp8"})
+    strategy = create_cosmos3_precision_strategy(config)
+
+    assert isinstance(strategy, Fp8W8A8W8A16Strategy)
+
+
+def test_factory_rejects_unregistered_direct_config() -> None:
+    config = Cosmos3MixedPrecisionConfig(format="nvfp4")
+
+    with pytest.raises(ValueError, match="registered formats=\\['fp8'\\]"):
+        create_cosmos3_precision_strategy(config)
 
 
 def test_config_parses_asymmetric_schedule_and_reasoner_policy() -> None:
@@ -110,6 +137,157 @@ def test_config_accepts_block_cache_modes(cache_mode: str) -> None:
 def test_config_defaults_to_bounded_gpu_block_cache() -> None:
     config = Cosmos3MixedPrecisionConfig.from_additional_config({})
     assert config.w8a16_cache == "gpu_block"
+
+
+def _modelopt_fp8_config(
+    *,
+    quant_method: str = "FP8",
+    serialized: bool = True,
+) -> ModelOptFp8Config:
+    return ModelOptFp8Config(
+        quant_method=quant_method,
+        is_checkpoint_fp8_serialized=serialized,
+        kv_cache_quant_method=None,
+        exclude_modules=[],
+    )
+
+
+@pytest.mark.parametrize(
+    "model_class_name",
+    ["Cosmos3OmniDiffusersPipeline", "Cosmos3OmniPipeline"],
+)
+def test_serialized_cosmos3_fp8_defaults_to_mixed_precision(
+    model_class_name: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    od_config = OmniDiffusionConfig(
+        model="test",
+        model_class_name=model_class_name,
+        quantization_config=_modelopt_fp8_config(),
+    )
+
+    with caplog.at_level(logging.INFO):
+        od_config._apply_cosmos3_mixed_precision_defaults()
+
+    config = Cosmos3MixedPrecisionConfig.from_additional_config(od_config.additional_config)
+    assert config.enabled
+    assert config.first_steps == 3
+    assert config.last_steps == 3
+    assert config.w8a16_cache == "gpu_block"
+    assert od_config.force_cutlass_fp8
+    assert "Automatically enabling CUTLASS FP8 kernels" in caplog.text
+
+
+def test_enrich_config_applies_default_after_quantization_propagation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.transformers_utils import config as vllm_config
+
+    from vllm_omni.diffusion.utils import hf_utils
+
+    monkeypatch.setattr(
+        hf_utils,
+        "get_diffusion_model_index",
+        lambda *args, **kwargs: {"_class_name": "Cosmos3OmniDiffusersPipeline"},
+    )
+    monkeypatch.setattr(
+        vllm_config,
+        "get_hf_file_to_dict",
+        lambda *args, **kwargs: {
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "FP8",
+                "ignore": ["proj_out"],
+            }
+        },
+    )
+    od_config = OmniDiffusionConfig(model="test")
+
+    od_config.enrich_config()
+
+    assert isinstance(od_config.quantization_config, ModelOptFp8Config)
+    assert od_config.additional_config["cosmos3_mixed_precision_format"] == "fp8"
+    assert od_config.force_cutlass_fp8 is True
+
+
+def test_explicit_none_disables_default_cosmos3_mixed_precision() -> None:
+    od_config = OmniDiffusionConfig(
+        model="test",
+        model_class_name="Cosmos3OmniDiffusersPipeline",
+        quantization_config=_modelopt_fp8_config(),
+        additional_config={"cosmos3_mixed_precision_format": "none"},
+    )
+
+    od_config._apply_cosmos3_mixed_precision_defaults()
+
+    assert od_config.additional_config["cosmos3_mixed_precision_format"] == "none"
+    assert od_config.force_cutlass_fp8 is None
+
+
+def test_explicit_false_preserves_native_fp8_kernel_selection_and_mixed_default(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    od_config = OmniDiffusionConfig(
+        model="test",
+        model_class_name="Cosmos3OmniDiffusersPipeline",
+        quantization_config=_modelopt_fp8_config(),
+        force_cutlass_fp8=False,
+    )
+
+    with caplog.at_level(logging.INFO):
+        od_config._apply_cosmos3_mixed_precision_defaults()
+
+    config = Cosmos3MixedPrecisionConfig.from_additional_config(od_config.additional_config)
+    assert config.enabled
+    assert od_config.force_cutlass_fp8 is False
+    assert "Using native FP8 kernel selection" in caplog.text
+
+
+def test_explicit_mixed_precision_preserves_explicit_false_cutlass() -> None:
+    od_config = OmniDiffusionConfig(
+        model="test",
+        model_class_name="Cosmos3OmniDiffusersPipeline",
+        quantization_config=_modelopt_fp8_config(),
+        additional_config={"cosmos3_mixed_precision_format": "fp8"},
+        force_cutlass_fp8=False,
+    )
+
+    od_config._apply_cosmos3_mixed_precision_defaults()
+
+    assert od_config.additional_config["cosmos3_mixed_precision_format"] == "fp8"
+    assert od_config.force_cutlass_fp8 is False
+
+
+def test_non_boolean_force_cutlass_fp8_is_rejected() -> None:
+    with pytest.raises(TypeError, match="force_cutlass_fp8 must be a bool or None"):
+        OmniDiffusionConfig(model="test", force_cutlass_fp8="false")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("model_class_name", "quant_config"),
+    [
+        ("OtherPipeline", _modelopt_fp8_config()),
+        ("Cosmos3OmniDiffusersPipeline", _modelopt_fp8_config(serialized=False)),
+        (
+            "Cosmos3OmniDiffusersPipeline",
+            _modelopt_fp8_config(quant_method="FP8_PER_CHANNEL_PER_TOKEN"),
+        ),
+    ],
+)
+def test_unsupported_checkpoint_does_not_enable_mixed_precision(
+    model_class_name: str,
+    quant_config: ModelOptFp8Config,
+) -> None:
+    od_config = OmniDiffusionConfig(
+        model="test",
+        model_class_name=model_class_name,
+        quantization_config=quant_config,
+    )
+
+    od_config._apply_cosmos3_mixed_precision_defaults()
+
+    assert "cosmos3_mixed_precision_format" not in od_config.additional_config
+    assert od_config.force_cutlass_fp8 is None
 
 
 class _Layer(torch.nn.Module):
@@ -254,6 +432,19 @@ def test_generation_cache_avoids_redequantizing_mutated_fp8_weight() -> None:
     assert not torch.equal(uncached_method.apply(uncached_layer, x), uncached_before)
 
 
+def test_cached_and_uncached_w8a16_materialization_are_bit_identical() -> None:
+    cached_runtime, _, cached_method, cached_layer = _runtime_and_method()
+    uncached_runtime, _, uncached_method, uncached_layer = _runtime_and_method(cache_mode="none")
+    x = torch.tensor([[2.0, 4.0]], dtype=torch.bfloat16)
+    cached_runtime.set_step(0, 3)
+    uncached_runtime.set_step(0, 3)
+
+    cached = cached_method.apply(cached_layer, x)
+    uncached = uncached_method.apply(uncached_layer, x)
+
+    assert torch.equal(cached, uncached)
+
+
 @pytest.mark.parametrize(
     ("cache_mode", "path", "is_cached"),
     [
@@ -270,6 +461,18 @@ def test_cache_scope(cache_mode: str, path: str, is_cached: bool) -> None:
     )
     assert method.state is not None
     assert (method.state.cached_weight_name is not None) is is_cached
+
+
+def test_bounded_cache_keeps_reasoner_weights_uncached() -> None:
+    runtime, _, method, _ = _runtime_and_method(
+        cache_mode="gpu_block",
+        path="reasoner",
+    )
+
+    assert method.state is not None
+    assert method.state.cached_weight_name is None
+    assert method.state.staged_weight is None
+    assert runtime.strategy.cache_stats() == (0, 0, 0)
 
 
 def test_cached_weight_dtype_must_match_activations() -> None:
@@ -307,12 +510,54 @@ def test_reset_clears_live_state_and_preserves_trace() -> None:
     assert not runtime.use_high_precision("generation")
 
 
+def test_pipeline_captures_enabled_mixed_precision_callbacks() -> None:
+    class _Transformer(torch.nn.Module):
+        mixed_precision_enabled = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.steps: list[tuple[int, int]] = []
+            self.reset_count = 0
+
+        def set_mixed_precision_step(self, step_index: int, num_steps: int) -> None:
+            self.steps.append((step_index, num_steps))
+
+        def reset_mixed_precision(self) -> None:
+            self.reset_count += 1
+
+    transformer = _Transformer()
+    setter, resetter = Cosmos3OmniDiffusersPipeline._resolve_mixed_precision_callbacks(transformer)
+    assert setter is not None
+    assert resetter is not None
+
+    # Captured bound methods remain valid if compilation later replaces the
+    # pipeline's public transformer attribute with a wrapper.
+    setter(2, 10)
+    resetter()
+    assert transformer.steps == [(2, 10)]
+    assert transformer.reset_count == 1
+
+
+def test_pipeline_rejects_missing_enabled_mixed_precision_lifecycle() -> None:
+    class _Transformer(torch.nn.Module):
+        mixed_precision_enabled = True
+
+    with pytest.raises(RuntimeError, match="required set_mixed_precision_step/reset_mixed_precision"):
+        Cosmos3OmniDiffusersPipeline._resolve_mixed_precision_callbacks(_Transformer())
+
+
+def test_pipeline_allows_missing_disabled_mixed_precision_lifecycle() -> None:
+    setter, resetter = Cosmos3OmniDiffusersPipeline._resolve_mixed_precision_callbacks(torch.nn.Identity())
+    assert setter is None
+    assert resetter is None
+
+
 def test_marlin_is_rejected_before_base_processing(monkeypatch) -> None:
     class _FakeMarlin:
         pass
 
     monkeypatch.setattr(
-        strategy_impl,
+        fp8_strategy_impl,
         "MarlinFP8ScaledMMLinearKernel",
         _FakeMarlin,
     )
@@ -379,11 +624,28 @@ def test_smoothquant_parameter_is_rejected() -> None:
 
 
 def test_install_discovers_both_components_without_fixed_inventory(monkeypatch) -> None:
+    class _FakeQuantMethod:
+        name = "fp8"
+
     class _FakeLinear(torch.nn.Module):
         def __init__(self, prefix: str) -> None:
             super().__init__()
             self.prefix = prefix
-            self.quant_method = SimpleNamespace(name="fp8")
+            self.quant_method = _FakeQuantMethod()
+
+    class _FakeLanguageModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.layers = torch.nn.Sequential(_FakeLinear("language_model.layers.0.q_proj"))
+
+    class _FakeTransformer(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.language_model = _FakeLanguageModel()
+            self.gen_layers = torch.nn.Sequential(
+                _FakeLinear("gen_layers.0.q_proj"),
+                _FakeLinear("gen_layers.0.out_proj"),
+            )
 
     monkeypatch.setattr(runtime_impl, "LinearBase", _FakeLinear)
     strategy = Fp8W8A8W8A16Strategy()
@@ -392,13 +654,7 @@ def test_install_discovers_both_components_without_fixed_inventory(monkeypatch) 
         Cosmos3MixedPrecisionConfig(format="fp8"),
         strategy,
     )
-    transformer = SimpleNamespace(
-        language_model=SimpleNamespace(layers=torch.nn.Sequential(_FakeLinear("language_model.layers.0.q_proj"))),
-        gen_layers=torch.nn.Sequential(
-            _FakeLinear("gen_layers.0.q_proj"),
-            _FakeLinear("gen_layers.0.out_proj"),
-        ),
-    )
+    transformer = _FakeTransformer()
 
     runtime.install(transformer)
 
@@ -480,7 +736,10 @@ def _cuda_block_provider_fixture(provider_cls):
         for weight, scale in zip(source_weights, (1.0, 0.5), strict=True)
     ]
     blocks = [_StagedLinearBlock(state).cuda() for state in states]
-    provider = provider_cls(torch.bfloat16)
+    provider = provider_cls(
+        torch.bfloat16,
+        fp8_strategy_impl.materialize_fp8_entry_into,
+    )
     for state, layer in zip(states, layers, strict=True):
         provider.add(state, layer)
     provider.install(blocks, lambda: True)
@@ -491,7 +750,50 @@ def _cuda_block_provider_fixture(provider_cls):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "provider_cls",
-    [GpuW8A16BlockWeightProvider, CpuW8A16BlockWeightProvider],
+    [GpuBlockWeightProvider, CpuBlockWeightProvider],
+)
+def test_block_provider_uses_injected_format_materializer(provider_cls) -> None:
+    class _OpaqueFormatLayer(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.register_buffer(
+                "weight",
+                torch.tensor([[1.0, 3.0], [2.0, 4.0]], device="cuda"),
+            )
+
+    state = Cosmos3PrecisionLayerState(
+        module_name="generation.0.opaque",
+        path="generation",
+        input_size=2,
+        output_size=2,
+    )
+    layer = _OpaqueFormatLayer()
+    block = _StagedLinearBlock(state).cuda()
+    materialized: list[str] = []
+
+    def materialize_into(target, entry) -> None:
+        materialized.append(entry.state.module_name)
+        target.copy_(entry.layer.weight.t().to(dtype=target.dtype))
+
+    provider = provider_cls(torch.bfloat16, materialize_into)
+    provider.add(state, layer)
+    provider.install([block], lambda: True)
+    provider.initialize()
+
+    value = torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16, device="cuda")
+    actual = block(value)
+    torch.accelerator.synchronize()
+
+    assert torch.equal(actual, torch.tensor([[5.0, 11.0]], dtype=torch.bfloat16, device="cuda"))
+    assert materialized
+    assert not hasattr(layer, "weight_scale")
+    provider.reset()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "provider_cls",
+    [GpuBlockWeightProvider, CpuBlockWeightProvider],
 )
 def test_block_provider_double_buffers_repeated_cfg_passes(provider_cls) -> None:
     provider, states, blocks = _cuda_block_provider_fixture(provider_cls)
@@ -507,7 +809,7 @@ def test_block_provider_double_buffers_repeated_cfg_passes(provider_cls) -> None
     torch.accelerator.synchronize()
     assert [state.staged_weight.data_ptr() for state in states] == pointers
     assert provider.device_bytes == 2 * 2 * 2 * 2
-    if provider_cls is CpuW8A16BlockWeightProvider:
+    if provider_cls is CpuBlockWeightProvider:
         assert provider.host_bytes == 2 * 2 * 2 * 2
         assert all(block.is_pinned() for block in provider._host_blocks)
     else:
@@ -515,7 +817,7 @@ def test_block_provider_double_buffers_repeated_cfg_passes(provider_cls) -> None
     # Completing the last block wraps block zero for another CFG pass.
     assert provider._loaded_block_for_slot[0] == 0
     provider.reset()
-    if provider_cls is CpuW8A16BlockWeightProvider:
+    if provider_cls is CpuBlockWeightProvider:
         assert not provider._host_blocks
         provider.preload_first()
         actual = value
@@ -546,7 +848,10 @@ def test_block_provider_post_hook_is_exception_safe() -> None:
         output_size=2,
     ).cuda()
     block = _RaisingBlock().cuda()
-    provider = GpuW8A16BlockWeightProvider(torch.bfloat16)
+    provider = GpuBlockWeightProvider(
+        torch.bfloat16,
+        fp8_strategy_impl.materialize_fp8_entry_into,
+    )
     provider.add(state, layer)
     provider.install([block], lambda: True)
     provider.initialize()

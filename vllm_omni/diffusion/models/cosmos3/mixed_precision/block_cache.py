@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Double-buffered W8A16 generation-weight staging.
+"""Format-neutral double-buffered dense-weight staging.
 
 The provider owns stable per-linear views into two maximum-block device
 buffers. Transformer-block hooks make one slot ready for the current block and
-fill the other slot for the next block. Subclasses differ only in where the
-next dense weight block comes from: resident FP8 tensors or pinned host BF16.
+fill the other slot for the next block. Quantization strategies inject how one
+source weight becomes a dense activation-precision matrix; provider subclasses
+own only where those materialized blocks reside.
 """
 
 from __future__ import annotations
@@ -14,9 +15,9 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
 
 import torch
+from torch.utils.hooks import RemovableHandle
 
 from vllm_omni.platforms import current_omni_platform
 
@@ -39,48 +40,39 @@ class Cosmos3PrecisionLayerState:
 
 
 @dataclass(frozen=True)
-class W8A16BlockEntry:
-    """Pair one validated linear state with its source layer."""
+class DenseBlockEntry:
+    """Pair one validated linear state with its format-specific source."""
 
     state: Cosmos3PrecisionLayerState
     layer: torch.nn.Module
 
 
-def dequantize_fp8_weight_into(
-    target: torch.Tensor,
-    entry: W8A16BlockEntry,
-) -> None:
-    """Materialize one logical FP8 matrix into a contiguous 16-bit view."""
-    state = entry.state
-    layer = entry.layer
-    source = layer.weight[: state.input_size, : state.output_size]
-    target.copy_(source.t())
-    target.mul_(
-        layer.weight_scale.reshape(1).to(
-            device=target.device,
-            dtype=target.dtype,
-        )
-    )
+DenseWeightMaterializer = Callable[[torch.Tensor, DenseBlockEntry], None]
 
 
-class W8A16BlockWeightProvider(ABC):
-    """Stage dense W8A16 weights through two reusable device slots."""
+class DenseBlockWeightProvider(ABC):
+    """Stage format-specific dense weights through two reusable slots."""
 
-    def __init__(self, activation_dtype: torch.dtype) -> None:
-        """Create an empty provider; inventory is populated during weight load."""
+    def __init__(
+        self,
+        activation_dtype: torch.dtype,
+        materialize_into: DenseWeightMaterializer,
+    ) -> None:
+        """Create a provider using the strategy-owned materializer."""
         self.activation_dtype = activation_dtype
-        self._entries: dict[int, list[W8A16BlockEntry]] = {}
+        self._materialize_into = materialize_into
+        self._entries: dict[int, list[DenseBlockEntry]] = {}
         self._blocks: list[torch.nn.Module] = []
         self._is_active: Callable[[], bool] | None = None
-        self._hook_handles: list[Any] = []
+        self._hook_handles: list[RemovableHandle] = []
 
         self._device: torch.device | None = None
         self._block_numels: list[int] = []
         self._buffers: tuple[torch.Tensor, torch.Tensor] | None = None
 
-        self._stage_stream: Any | None = None
-        self._ready_events: tuple[Any, Any] | None = None
-        self._free_events: tuple[Any, Any] | None = None
+        self._stage_stream: torch.cuda.Stream | None = None
+        self._ready_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
+        self._free_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
         self._slot_was_used = [False, False]
         self._loaded_block_for_slot: list[int | None] = [None, None]
 
@@ -96,7 +88,7 @@ class W8A16BlockWeightProvider(ABC):
 
     def add(self, state: Cosmos3PrecisionLayerState, layer: torch.nn.Module) -> None:
         """Add one generation linear to its dynamically discovered block."""
-        self._entries.setdefault(state.block_index, []).append(W8A16BlockEntry(state=state, layer=layer))
+        self._entries.setdefault(state.block_index, []).append(DenseBlockEntry(state=state, layer=layer))
 
     def install(
         self,
@@ -117,24 +109,30 @@ class W8A16BlockWeightProvider(ABC):
             )
             self._hook_handles.extend((pre_handle, post_handle))
 
-    def _make_pre_hook(self, block_index: int):
+    def _make_pre_hook(
+        self,
+        block_index: int,
+    ) -> Callable[[torch.nn.Module, tuple[object, ...]], None]:
         """Build a hook that waits for this block's staged weight slot."""
 
-        def pre_hook(module: torch.nn.Module, args: tuple[Any, ...]) -> None:
+        def pre_hook(module: torch.nn.Module, args: tuple[object, ...]) -> None:
             del module, args
             if self._is_active is not None and self._is_active():
                 self.prepare_block(block_index)
 
         return pre_hook
 
-    def _make_post_hook(self, block_index: int):
+    def _make_post_hook(
+        self,
+        block_index: int,
+    ) -> Callable[[torch.nn.Module, tuple[object, ...], object], object]:
         """Build an exception-safe hook that releases this block's slot."""
 
         def post_hook(
             module: torch.nn.Module,
-            args: tuple[Any, ...],
-            output: Any,
-        ) -> Any:
+            args: tuple[object, ...],
+            output: object,
+        ) -> object:
             del module, args
             if self._is_active is not None and self._is_active():
                 self.finish_block(block_index)
@@ -147,19 +145,21 @@ class W8A16BlockWeightProvider(ABC):
         if self._initialized:
             return
         if not self._blocks:
-            raise RuntimeError("W8A16 block provider has no installed generation blocks")
+            raise RuntimeError("Dense block provider has no installed generation blocks")
         if set(self._entries) != set(range(len(self._blocks))):
             raise RuntimeError(
-                "W8A16 block provider inventory mismatch: "
+                "Dense block provider inventory mismatch: "
                 f"blocks={len(self._blocks)}, populated={sorted(self._entries)}"
             )
 
         devices = self._layout_block_entries()
         if len(devices) != 1:
-            raise RuntimeError(f"W8A16 block provider spans devices: {sorted(map(str, devices))}")
+            raise RuntimeError(f"Dense block provider spans devices: {sorted(map(str, devices))}")
         self._device = devices.pop()
         if self._device.type != "cuda":
-            raise RuntimeError(f"W8A16 block staging currently requires CUDA-resident FP8 weights; got {self._device}")
+            raise RuntimeError(
+                f"Dense block staging currently requires CUDA-resident source weights; got {self._device}"
+            )
 
         self._initialize_source()
         self._allocate_device_slots()
@@ -186,7 +186,7 @@ class W8A16BlockWeightProvider(ABC):
             )
             indices = [entry.state.linear_index for entry in entries]
             if indices != list(range(len(entries))):
-                raise RuntimeError(f"W8A16 block {block_index} has non-contiguous linear indices {indices}")
+                raise RuntimeError(f"Dense block {block_index} has non-contiguous linear indices {indices}")
             self._entries[block_index] = entries
 
             offset = 0
@@ -301,27 +301,32 @@ class W8A16BlockWeightProvider(ABC):
         self._used_since_reset = False
 
 
-class GpuW8A16BlockWeightProvider(W8A16BlockWeightProvider):
-    """Reconstruct the next dense block from resident canonical FP8 weights."""
+class GpuBlockWeightProvider(DenseBlockWeightProvider):
+    """Materialize the next dense block from resident quantized weights."""
 
     def _initialize_source(self) -> None:
-        """Use the existing FP8 tensors directly; no side source is needed."""
+        """Use the existing source tensors directly; no side source is needed."""
 
     def _fill_slot(self, block_index: int, slot: int) -> None:
-        """Convert one block's FP8 matrices into its stable device views."""
+        """Materialize one block into its stable device views."""
         del slot
+        materialize_into = self._materialize_into
         with torch.no_grad():
             for entry in self._entries[block_index]:
                 assert entry.state.staged_weight is not None
-                dequantize_fp8_weight_into(entry.state.staged_weight, entry)
+                materialize_into(entry.state.staged_weight, entry)
 
 
-class CpuW8A16BlockWeightProvider(W8A16BlockWeightProvider):
+class CpuBlockWeightProvider(DenseBlockWeightProvider):
     """Stream dense blocks from request-scoped pinned RAM into two CUDA slots."""
 
-    def __init__(self, activation_dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        activation_dtype: torch.dtype,
+        materialize_into: DenseWeightMaterializer,
+    ) -> None:
         """Create a provider with a lazily built pinned host source."""
-        super().__init__(activation_dtype)
+        super().__init__(activation_dtype, materialize_into)
         self._host_blocks: list[torch.Tensor] = []
 
     def _initialize_source(self) -> None:
@@ -336,6 +341,7 @@ class CpuW8A16BlockWeightProvider(W8A16BlockWeightProvider):
             device=self._device,
         )
 
+        materialize_into = self._materialize_into
         with torch.no_grad():
             for block_index, block_numel in enumerate(self._block_numels):
                 host_block = torch.empty(
@@ -351,7 +357,7 @@ class CpuW8A16BlockWeightProvider(W8A16BlockWeightProvider):
                         state.output_size,
                         state.input_size,
                     )
-                    dequantize_fp8_weight_into(device_view, entry)
+                    materialize_into(device_view, entry)
                     host_block[state.block_offset : state.block_offset + numel].copy_(
                         device_view.reshape(-1), non_blocking=False
                     )

@@ -284,6 +284,36 @@ def test_serve_cli_accepts_diffusion_pipeline_profiler_flag():
     assert stage_cfg["engine_args"]["enable_diffusion_pipeline_profiler"] is True
 
 
+@pytest.mark.parametrize(
+    ("command_args", "expected"),
+    [
+        (["Qwen/Qwen-Image", "--omni", "--force-cutlass-fp8"], True),
+        (["Qwen/Qwen-Image", "--omni", "--no-force-cutlass-fp8"], False),
+        (["--force-cutlass-fp8", "Qwen/Qwen-Image", "--omni"], True),
+        (["--no-force-cutlass-fp8", "Qwen/Qwen-Image", "--omni"], False),
+    ],
+)
+def test_serve_cli_preserves_force_cutlass_fp8_tristate(
+    command_args: list[str],
+    expected: bool,
+) -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", *command_args])
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+    assert explicit_kwargs["force_cutlass_fp8"] is expected
+    assert stage_cfg["engine_args"]["force_cutlass_fp8"] is expected
+
+
+def test_default_diffusion_stage_leaves_force_cutlass_fp8_unset() -> None:
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg({})[0]
+    assert stage_cfg["engine_args"]["force_cutlass_fp8"] is None
+
+
 def test_serve_cli_forwards_distilled_lora_to_diffusion_stage():
     """Ensure startup distilled LoRA options reach the online diffusion stage."""
     parser = TrackingArgumentParser()

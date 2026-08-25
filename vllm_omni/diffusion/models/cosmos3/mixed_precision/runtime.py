@@ -116,7 +116,7 @@ class Cosmos3MixedPrecisionRuntime:
         missing = [path for path, count in self.installed_counts.items() if count == 0]
         if missing:
             raise ValueError(
-                "Cosmos3 mixed precision found no compatible serialized ModelOpt FP8 linears under "
+                f"Cosmos3 {self.config.format} mixed precision found no compatible linears under "
                 f"{missing}; discovered counts={self.installed_counts}"
             )
 
@@ -219,10 +219,6 @@ class Cosmos3MixedPrecisionRuntime:
         )
         self._ready_logged = True
 
-    def finalize(self) -> None:
-        """Explicitly finalize cache providers after checkpoint post-load."""
-        self._log_ready_once()
-
     def use_high_precision(self, path: PrecisionPath) -> bool:
         """Resolve reasoner policy or the current generation-step selection."""
         if path == "reasoner":
@@ -244,8 +240,8 @@ class Cosmos3MixedPrecisionRuntime:
         """Finish the request trace and return strategy resources to idle state."""
         if self._trace:
             self.last_trace = tuple(self._trace)
-            logger.info(
-                "COSMOS3_MIXED_PRECISION_TRACE strategy=%s steps=%s",
+            logger.debug(
+                "Cosmos3 mixed-precision trace: strategy=%s, steps=%s",
                 self.config.format,
                 ",".join(self.last_trace),
             )

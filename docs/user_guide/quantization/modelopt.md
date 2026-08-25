@@ -77,6 +77,7 @@ backend and quality validation.
 | FLUX.2-klein 4B | `feizhai123/flux2-klein-4b-modelopt-fp8` | Diffusion transformer | Validated for ModelOpt FP8 checkpoints |
 | HunyuanImage-3.0 | `feizhai123/hunyuan-image3-modelopt-fp8` | MoE diffusion transformer | Validated for ModelOpt FP8 checkpoints |
 | HunyuanImage-3.0 | `feizhai123/hunyuan-image3-modelopt-mixed-experts-nvfp4-dense-fp8` | MoE diffusion transformer | Validated for ModelOpt mixed FP8/NVFP4 checkpoints |
+| Cosmos3 | Model-specific serialized tensorwise FP8 checkpoint | Reasoner and generation linears | Validated for mixed W8A8/W8A16 denoising on CUDA |
 | Wan2.2 | Not available | Diffusion transformer | Not validated |
 
 For full serving commands and benchmark context, see
@@ -196,11 +197,104 @@ omni = Omni(
 )
 ```
 
+### Cosmos3 Mixed Denoising-Step Precision
+
+Cosmos3 uses mixed activation precision by default when it loads a supported
+serialized tensorwise ModelOpt FP8 checkpoint. Eligible reasoner and generation
+linear layers retain their FP8 weights. The first and last three denoising
+steps use 16-bit activations with dense BF16/FP16 weights reconstructed from
+that FP8 source; middle steps delegate to the checkpoint's normal W8A8 linear
+method. vLLM-Omni also selects CUTLASS automatically so the canonical FP8
+matrix remains available to both paths.
+
+Precision is selected once at the scheduler-step boundary. Every conditional,
+unconditional, or CFG-parallel transformer call belonging to that step
+therefore uses the same precision. The setting applies to eligible linear
+layers only: attention QK/softmax/AV kernels, normalization, nonlinearities,
+residuals, and other non-linear operations keep their normal runtime dtype.
+
+No mixed-precision flag is required for the default policy:
+
+```python
+from vllm_omni import Omni
+
+omni = Omni(
+    model="<serialized-cosmos3-modelopt-fp8-checkpoint>",
+)
+```
+
+For online serving, the equivalent command is:
+
+```bash
+vllm serve <serialized-cosmos3-modelopt-fp8-checkpoint> \
+  --omni
+```
+
+Explicitly setting `--no-force-cutlass-fp8` preserves the checkpoint's
+native FP8 kernel selection without disabling the automatic mixed-precision
+policy. This is different from leaving the option unset, which permits Cosmos3
+to select CUTLASS for the default mixed path. With an explicit false override,
+model loading fails closed only if native selection chooses a backend such as
+Marlin that repacks the canonical FP8 weights required by W8A16 reconstruction.
+Set `cosmos3_mixed_precision_format` to `none` to disable mixed precision.
+
+Use `additional_config` only to override the defaults. For example:
+
+```bash
+vllm serve <serialized-cosmos3-modelopt-fp8-checkpoint> \
+  --omni \
+  --additional-config '{
+    "cosmos3_mixed_precision_first_steps":2,
+    "cosmos3_mixed_precision_last_steps":4,
+    "cosmos3_mixed_precision_reasoner_policy":"high_precision",
+    "cosmos3_mixed_precision_w8a16_cache":"gpu_block"
+  }'
+```
+
+| `additional_config` key | Values | Default | Description |
+|-------------------------|--------|---------|-------------|
+| `cosmos3_mixed_precision_format` | `none`, `fp8` | `fp8` for supported serialized Cosmos3 ModelOpt FP8 checkpoints | Selects the mixed-precision strategy. Set `none` to opt out. |
+| `cosmos3_mixed_precision_first_steps` | non-negative integer | `3` | Number of initial denoising steps using W8A16. |
+| `cosmos3_mixed_precision_last_steps` | non-negative integer | `3` | Number of final denoising steps using W8A16. Overlap selects W8A16 once. |
+| `cosmos3_mixed_precision_reasoner_policy` | `high_precision`, `base_precision` | `high_precision` | Selects W8A16 or the checkpoint's W8A8 method for the pre-denoising reasoner path. |
+| `cosmos3_mixed_precision_w8a16_cache` | `gpu_block`, `cpu_block`, `none`, `generation`, `all` | `gpu_block` | Selects where dense 16-bit weights are staged or retained. |
+
+Cache modes trade memory for staging work:
+
+- `gpu_block` keeps two maximum-generation-block device buffers and
+  reconstructs the next block from resident FP8 weights on a side CUDA stream.
+- `cpu_block` keeps the same two device buffers and copies the next block from
+  request-scoped pinned host memory. The pinned source is released before
+  decoded output transfer.
+- `none` retains no dense cache and reconstructs each W8A16 weight on demand.
+- `generation` retains dense weights for all generation linears.
+- `all` retains dense weights for both generation and reasoner linears.
+
+The default `gpu_block` mode deliberately does not cache reasoner weights. The
+reasoner executes before the denoising loop rather than once per denoising
+step, so reconstructing those weights avoids another persistent cache. Use
+`all` only when reasoner latency is more important than the added device
+memory.
+
+The automatic path requires a serialized tensorwise ModelOpt `FP8` checkpoint
+whose linears retain canonical rank-2 E4M3 weights and one finite positive
+weight scale. SmoothQuant `pre_quant_scale`, Marlin-repacked layouts, online
+BF16-to-FP8 conversion, tensor parallelism, and interleaved requests are not
+validated.
+The current one-step engine initialization request deliberately uses the base
+W8A8 path because it cannot yet be distinguished from a real one-step request.
+
+Cache-mode output identity only establishes that the staging strategies
+preserve the same mixed-precision arithmetic. It does not establish quality
+parity with a BF16 checkpoint. Compare mixed precision with a BF16 reference
+using the same inputs, scheduler, sampling parameters, and seed before
+deployment.
+
 ## Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `force_cutlass_fp8` / `--force-cutlass-fp8` | bool | `False` | Force CUTLASS FP8 linear kernels for supported ModelOpt FP8 diffusion stages on CUDA SM89+ |
+| `force_cutlass_fp8` / `--[no-]force-cutlass-fp8` | bool or unset | unset | Override CUTLASS FP8 kernel selection for supported ModelOpt FP8 diffusion stages on CUDA SM89+; Cosmos3 enables it for the default mixed path when unset and preserves native selection with `--no-force-cutlass-fp8` |
 | `--linear-backend cutlass` | str | auto | Select the validated CUTLASS linear backend for supported ModelOpt NVFP4 or mixed FP8/NVFP4 diffusion stages |
 | `--moe-backend cutlass` | str | auto | Select the validated CUTLASS MoE backend for supported ModelOpt mixed MoE checkpoints |
 

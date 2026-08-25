@@ -9,20 +9,22 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
-MixedPrecisionFormat = Literal["none", "fp8"]
+from .registry import MIXED_PRECISION_FORMATS
+
+MixedPrecisionFormat = str
 ReasonerPolicy = Literal["high_precision", "base_precision"]
 PrecisionPath = Literal["reasoner", "generation"]
-W8A16CacheMode = Literal[
+DenseWeightCacheMode = Literal[
     "none",
     "generation",
     "all",
     "cpu_block",
     "gpu_block",
 ]
+W8A16CacheMode = DenseWeightCacheMode
 
-MIXED_PRECISION_FORMATS = frozenset({"none", "fp8"})
 REASONER_POLICIES = frozenset({"high_precision", "base_precision"})
-W8A16_CACHE_MODES = frozenset(
+DENSE_WEIGHT_CACHE_MODES = frozenset(
     {
         "none",
         "generation",
@@ -31,6 +33,7 @@ W8A16_CACHE_MODES = frozenset(
         "gpu_block",
     }
 )
+W8A16_CACHE_MODES = DENSE_WEIGHT_CACHE_MODES
 
 
 @dataclass(frozen=True)
@@ -41,7 +44,9 @@ class Cosmos3MixedPrecisionConfig:
     first_steps: int = 3
     last_steps: int = 3
     reasoner_policy: ReasonerPolicy = "high_precision"
-    w8a16_cache: W8A16CacheMode = "gpu_block"
+    # Retain the original field and additional_config spelling for API
+    # compatibility. Strategies should use dense_weight_cache below.
+    w8a16_cache: DenseWeightCacheMode = "gpu_block"
 
     @classmethod
     def from_additional_config(
@@ -90,12 +95,17 @@ class Cosmos3MixedPrecisionConfig:
             )
 
         return cls(
-            format=precision_format,  # type: ignore[arg-type]
+            format=precision_format,
             first_steps=first_steps,
             last_steps=last_steps,
             reasoner_policy=reasoner_policy,  # type: ignore[arg-type]
             w8a16_cache=w8a16_cache,  # type: ignore[arg-type]
         )
+
+    @property
+    def dense_weight_cache(self) -> DenseWeightCacheMode:
+        """Return the format-neutral dense-weight cache selection."""
+        return self.w8a16_cache
 
     @property
     def enabled(self) -> bool:
@@ -115,7 +125,7 @@ class Cosmos3MixedPrecisionConfig:
         return step_index < self.first_steps or step_index >= num_steps - self.last_steps
 
 
-def _non_negative_int(value: Any, name: str) -> int:
+def _non_negative_int(value: object, name: str) -> int:
     """Validate an integer configuration field without accepting booleans."""
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise TypeError(f"{name} must be a non-negative integer")

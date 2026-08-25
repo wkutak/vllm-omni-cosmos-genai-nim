@@ -1074,7 +1074,7 @@ class AsyncOmniEngine:
             "diffusion_kv_cache_skip_steps": kwargs.get("diffusion_kv_cache_skip_steps", None),
             "diffusion_kv_cache_skip_layers": kwargs.get("diffusion_kv_cache_skip_layers", None),
             **({"diffusion_attention_config": attention_config} if attention_config is not None else {}),
-            "force_cutlass_fp8": bool(kwargs.get("force_cutlass_fp8", False)),
+            "force_cutlass_fp8": kwargs.get("force_cutlass_fp8"),
             "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
             "streaming_output": kwargs.get("diffusion_streaming_output", False),
             "enable_ar_profiler": kwargs.get("enable_ar_profiler", False),

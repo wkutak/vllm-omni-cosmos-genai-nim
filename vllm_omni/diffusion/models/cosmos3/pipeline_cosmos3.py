@@ -33,7 +33,7 @@ import json
 import math
 import os
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import fields
 from typing import Any, ClassVar
 
@@ -916,6 +916,10 @@ class Cosmos3OmniDiffusersPipeline(
             sound_dim=sound_dim,
             sound_latent_fps=sound_latent_fps,
         )
+        (
+            self._mixed_precision_step_setter,
+            self._mixed_precision_resetter,
+        ) = self._resolve_mixed_precision_callbacks(self.transformer)
         self.is_edge_model = transformer_cls is Cosmos3EdgeVFMTransformer
 
         # Opt-in: route the per-CFG-branch UND text K/V through the shared
@@ -1745,14 +1749,32 @@ class Cosmos3OmniDiffusersPipeline(
         return self._num_timesteps
 
     def _set_mixed_precision_step(self, step_index: int, num_steps: int) -> None:
-        setter = getattr(self.transformer, "set_mixed_precision_step", None)
-        if setter is not None:
-            setter(step_index, num_steps)
+        if self._mixed_precision_step_setter is not None:
+            self._mixed_precision_step_setter(step_index, num_steps)
 
     def _reset_mixed_precision(self) -> None:
-        resetter = getattr(self.transformer, "reset_mixed_precision", None)
-        if resetter is not None:
-            resetter()
+        if self._mixed_precision_resetter is not None:
+            self._mixed_precision_resetter()
+
+    @staticmethod
+    def _resolve_mixed_precision_callbacks(
+        transformer: nn.Module,
+    ) -> tuple[
+        Callable[[int, int], None] | None,
+        Callable[[], None] | None,
+    ]:
+        """Bind the enabled runtime before compilation or offloading wrappers."""
+        if not getattr(transformer, "mixed_precision_enabled", False):
+            return None, None
+
+        setter = getattr(transformer, "set_mixed_precision_step", None)
+        resetter = getattr(transformer, "reset_mixed_precision", None)
+        if not callable(setter) or not callable(resetter):
+            raise RuntimeError(
+                "Cosmos3 mixed precision is enabled, but the transformer does not "
+                "implement the required set_mixed_precision_step/reset_mixed_precision lifecycle"
+            )
+        return setter, resetter
 
     @staticmethod
     def _distilled_unsupported_error(detail: str) -> ValueError:

@@ -565,11 +565,12 @@ class OmniServeCommand(CLISubcommand):
         )
         omni_config_group.add_argument(
             "--force-cutlass-fp8",
-            action="store_true",
+            action=argparse.BooleanOptionalAction,
             default=None,
             help=(
                 "Diffusion-only runtime override for ModelOpt FP8 checkpoints: "
                 "force CUTLASS FP8 linear kernels on CUDA SM89+ devices. "
+                "Use --no-force-cutlass-fp8 to preserve native kernel selection. "
                 "Ignored for BF16, non-ModelOpt FP8, ROCm, and older CUDA GPUs."
             ),
         )

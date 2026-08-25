@@ -1,0 +1,6 @@
+.git
+.sandbox/outputs*
+.sandbox/old_outputs*
+**/__pycache__
+**/.pytest_cache
+*.pyc
