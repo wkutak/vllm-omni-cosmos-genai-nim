@@ -43,7 +43,6 @@ from vllm_omni.platforms import current_omni_platform
 from .mixed_precision import (
     Cosmos3MixedPrecisionConfig,
     Cosmos3MixedPrecisionRuntime,
-    create_cosmos3_precision_strategy,
 )
 
 if TYPE_CHECKING:
@@ -1139,13 +1138,15 @@ class Cosmos3VFMTransformer(nn.Module):
         mixed_precision_config = Cosmos3MixedPrecisionConfig.from_additional_config(
             getattr(od_config, "additional_config", None)
         )
-        mixed_precision_strategy = None
-        if mixed_precision_config.enabled:
-            mixed_precision_strategy = create_cosmos3_precision_strategy(
-                mixed_precision_config,
-                activation_dtype=dtype,
-            )
-            mixed_precision_strategy.validate_quant_config(quant_config)
+        if mixed_precision_config is not None:
+            if get_tensor_model_parallel_world_size() != 1:
+                raise ValueError("Cosmos3 mixed precision currently supports tensor parallel size 1 only")
+            parallel_config = getattr(od_config, "parallel_config", None)
+            if bool(getattr(parallel_config, "use_hsdp", False)):
+                raise ValueError(
+                    "Cosmos3 mixed precision is incompatible with HSDP because "
+                    "alternate-path snapshots are replicated module buffers"
+                )
 
         self.language_model = self._language_model_cls(
             hidden_size=self.hidden_size,
@@ -1206,11 +1207,8 @@ class Cosmos3VFMTransformer(nn.Module):
         )
 
         self.mixed_precision_runtime: Cosmos3MixedPrecisionRuntime | None = None
-        if mixed_precision_strategy is not None:
-            self.mixed_precision_runtime = Cosmos3MixedPrecisionRuntime(
-                mixed_precision_config,
-                mixed_precision_strategy,
-            )
+        if mixed_precision_config is not None:
+            self.mixed_precision_runtime = Cosmos3MixedPrecisionRuntime(mixed_precision_config)
             self.mixed_precision_runtime.install(self)
 
         self.norm_moe_gen = RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
