@@ -10,10 +10,10 @@ from dataclasses import dataclass
 from typing import Literal, cast
 
 ReasonerPolicy = Literal["native", "a16"]
-CacheMode = Literal["none", "full", "block"]
+CacheMode = Literal["none", "block"]
 
 _REASONER_POLICIES = frozenset({"native", "a16"})
-_CACHE_MODES = frozenset({"none", "full", "block"})
+_CACHE_MODES = frozenset({"none", "block"})
 _CONFIG_FIELDS = frozenset({"first_steps", "last_steps", "reasoner", "cache"})
 
 

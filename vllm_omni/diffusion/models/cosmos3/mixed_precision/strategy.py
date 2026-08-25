@@ -11,9 +11,10 @@ import torch
 import torch.nn.functional as F
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptFp8LinearMethod,
-    ModelOptFp8PcPtLinearMethod,
     ModelOptNvFp4LinearMethod,
 )
+from vllm.model_executor.layers.quantization.utils import nvfp4_emulation_utils
+from vllm.triton_utils import tl, triton
 
 _FP8_WEIGHT_DTYPES = tuple(
     dtype
@@ -23,11 +24,10 @@ _FP8_WEIGHT_DTYPES = tuple(
     )
     if dtype is not None
 )
-_WEIGHT = "_cosmos3_precision_weight"
-_WEIGHT_SCALE = "_cosmos3_precision_weight_scale"
-_WEIGHT_GLOBAL_SCALE = "_cosmos3_precision_weight_global_scale"
 _NVFP4_BLOCK_SIZE = 16
+_NVFP4_DEQUANT_BLOCK = 512
 _NVFP4_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_NVFP4_LUT_CACHE: dict[torch.device, torch.Tensor] = {}
 
 
 class Cosmos3PrecisionStrategy:
@@ -37,16 +37,24 @@ class Cosmos3PrecisionStrategy:
         """Return whether this strategy owns a native linear method."""
         raise NotImplementedError
 
-    def snapshot_before_processing(
+    def validate_before_processing(
+        self,
+        method: object,
+        layer: torch.nn.Module,
+        module_name: str,
+    ) -> None:
+        """Reject native transforms that cannot support live dequantization."""
+
+    def validate_after_processing(
         self,
         layer: torch.nn.Module,
         module_name: str,
     ) -> None:
-        """Capture canonical tensors before the native backend may repack them."""
+        """Validate the live native weight representation."""
         raise NotImplementedError
 
     def materialize(self, layer: torch.nn.Module) -> torch.Tensor:
-        """Materialize the captured weight as a dense BF16 matrix."""
+        """Materialize the live quantized weight as a dense BF16 matrix."""
         raise NotImplementedError
 
     def materialize_into(
@@ -87,12 +95,27 @@ class Fp8W8A8W8A16Strategy(Cosmos3PrecisionStrategy):
     """Use native ModelOpt W8A8 or reference dense W8A16."""
 
     def accepts(self, method: object | None) -> bool:
-        return isinstance(
-            method,
-            (ModelOptFp8LinearMethod, ModelOptFp8PcPtLinearMethod),
-        )
+        return isinstance(method, ModelOptFp8LinearMethod)
 
-    def snapshot_before_processing(
+    def validate_before_processing(
+        self,
+        method: object,
+        layer: torch.nn.Module,
+        module_name: str,
+    ) -> None:
+        if hasattr(layer, "pre_quant_scale"):
+            raise ValueError(f"{module_name} uses unsupported SmoothQuant pre_quant_scale")
+        weight_scale = getattr(layer, "weight_scale", None)
+        if not isinstance(weight_scale, torch.Tensor) or weight_scale.numel() != 1:
+            raise ValueError(f"{module_name} requires serialized tensorwise FP8 weights")
+        fp8_kernel = getattr(method, "fp8_linear", None)
+        if type(fp8_kernel).__name__ == "MarlinFP8ScaledMMLinearKernel":
+            raise ValueError(
+                f"{module_name} selected Marlin FP8, which repacks the only weight copy; "
+                "use a backend that retains canonical FP8 weights"
+            )
+
+    def validate_after_processing(
         self,
         layer: torch.nn.Module,
         module_name: str,
@@ -106,31 +129,42 @@ class Fp8W8A8W8A16Strategy(Cosmos3PrecisionStrategy):
             raise ValueError(f"{module_name} requires a rank-2 FP8 weight, got {tuple(weight.shape)}")
         if not isinstance(scale, torch.Tensor):
             raise ValueError(f"{module_name} has an FP8 weight but no weight_scale")
-        if not _fp8_scale_is_supported(weight, scale):
+        if scale.numel() != 1:
+            raise ValueError(f"{module_name} requires one live FP8 weight scale")
+        input_size = int(layer.input_size_per_partition)
+        output_size = int(layer.output_size_per_partition)
+        if weight.shape[0] < input_size or weight.shape[1] < output_size:
             raise ValueError(
-                f"{module_name} uses unsupported block-scaled FP8: "
-                f"weight={tuple(weight.shape)}, scale={tuple(scale.shape)}"
+                f"{module_name} live FP8 weight shape {tuple(weight.shape)} does not cover "
+                f"(K, N)=({input_size}, {output_size})"
             )
-        expected = (
-            int(layer.output_size_per_partition),
-            int(layer.input_size_per_partition),
-        )
-        if tuple(weight.shape) != expected:
-            raise ValueError(f"{module_name} expected FP8 weight shape {expected}, got {tuple(weight.shape)}")
         _validate_positive_finite_scale(scale, module_name)
-        _register_snapshot(layer, _WEIGHT, weight)
-        _register_snapshot(layer, _WEIGHT_SCALE, scale)
 
     def materialize(self, layer: torch.nn.Module) -> torch.Tensor:
-        weight = _required_snapshot(layer, _WEIGHT, "FP8 weight")
-        scale = _required_snapshot(layer, _WEIGHT_SCALE, "FP8 weight scale")
-        values = weight.to(torch.float32)
-        scale = scale.reshape(-1).to(device=values.device, dtype=torch.float32)
-        if scale.numel() == 1:
-            values = values * scale.reshape(())
-        else:
-            values = values * scale.reshape(-1, 1)
-        return values.to(torch.bfloat16)
+        input_size = int(layer.input_size_per_partition)
+        output_size = int(layer.output_size_per_partition)
+        output = torch.empty(
+            (output_size, input_size),
+            dtype=torch.bfloat16,
+            device=layer.weight.device,
+        )
+        self.materialize_into(output, layer)
+        return output
+
+    def materialize_into(
+        self,
+        target: torch.Tensor,
+        layer: torch.nn.Module,
+    ) -> None:
+        input_size = int(layer.input_size_per_partition)
+        output_size = int(layer.output_size_per_partition)
+        target.copy_(layer.weight[:input_size, :output_size].t())
+        target.mul_(
+            layer.weight_scale.reshape(1).to(
+                device=target.device,
+                dtype=target.dtype,
+            )
+        )
 
 
 class Nvfp4W4A4W4A16Strategy(Cosmos3PrecisionStrategy):
@@ -139,20 +173,37 @@ class Nvfp4W4A4W4A16Strategy(Cosmos3PrecisionStrategy):
     def accepts(self, method: object | None) -> bool:
         return isinstance(method, ModelOptNvFp4LinearMethod)
 
-    def snapshot_before_processing(
+    def validate_before_processing(
+        self,
+        method: object,
+        layer: torch.nn.Module,
+        module_name: str,
+    ) -> None:
+        kernel = getattr(method, "kernel", None)
+        if type(kernel).__name__ != "CutlassNvFp4LinearKernel":
+            kernel_name = type(kernel).__name__ if kernel is not None else "none"
+            raise ValueError(
+                f"{module_name} selected unsupported NVFP4 backend {kernel_name}; "
+                "live W4A16 dequantization currently requires CUTLASS"
+            )
+        _clamp_nvfp4_scales(layer)
+        global_scale = _nvfp4_global_scale(layer)
+        if global_scale is None or global_scale.numel() != 1:
+            raise ValueError(f"{module_name} is missing ModelOpt NVFP4 scales")
+
+    def validate_after_processing(
         self,
         layer: torch.nn.Module,
         module_name: str,
     ) -> None:
         packed = getattr(layer, "weight", None)
         scale = getattr(layer, "weight_scale", None)
-        global_scale = _nvfp4_global_scale(layer)
+        global_scale = getattr(layer, "weight_global_scale", None)
         if not isinstance(packed, torch.Tensor) or packed.dtype != torch.uint8:
             dtype = getattr(packed, "dtype", None)
-            raise TypeError(f"{module_name} requires a canonical packed NVFP4 weight, got {dtype}")
-        if not isinstance(scale, torch.Tensor) or global_scale is None:
-            raise ValueError(f"{module_name} is missing ModelOpt NVFP4 scales")
-
+            raise TypeError(f"{module_name} requires a live packed NVFP4 weight, got {dtype}")
+        if not isinstance(scale, torch.Tensor) or not isinstance(global_scale, torch.Tensor):
+            raise ValueError(f"{module_name} is missing live NVFP4 scales")
         output_size = int(layer.output_size_per_partition)
         input_size = int(layer.input_size_per_partition)
         if input_size % _NVFP4_BLOCK_SIZE != 0:
@@ -160,75 +211,148 @@ class Nvfp4W4A4W4A16Strategy(Cosmos3PrecisionStrategy):
                 f"{module_name} input size {input_size} is not divisible by {_NVFP4_BLOCK_SIZE}"
             )
         expected_weight = (output_size, input_size // 2)
-        if tuple(packed.shape) != expected_weight:
+        if packed.shape[0] < expected_weight[0] or packed.shape[1] < expected_weight[1]:
             raise ValueError(
-                f"{module_name} expected packed NVFP4 weight shape {expected_weight}, got {tuple(packed.shape)}"
+                f"{module_name} live NVFP4 weight shape {tuple(packed.shape)} "
+                f"does not cover {expected_weight}"
             )
-        expected_scale = (output_size, input_size // _NVFP4_BLOCK_SIZE)
-        if scale.ndim != 2 or scale.shape[0] < expected_scale[0] or scale.shape[1] < expected_scale[1]:
-            raise ValueError(
-                f"{module_name} NVFP4 scale shape {tuple(scale.shape)} does not cover {expected_scale}"
-            )
-
-        _clamp_nvfp4_scales(layer)
-        scale = layer.weight_scale[: expected_scale[0], : expected_scale[1]]
-        global_scale = _nvfp4_global_scale(layer)
-        if global_scale is None:
-            raise RuntimeError(f"{module_name} lost its NVFP4 global scale during snapshot preparation")
-        _validate_positive_finite_scale(scale, module_name)
         _validate_positive_finite_scale(global_scale, module_name)
         if global_scale.numel() != 1:
             raise ValueError(f"{module_name} requires one NVFP4 global scale")
-
-        _register_snapshot(layer, _WEIGHT, packed)
-        _register_snapshot(layer, _WEIGHT_SCALE, scale)
-        _register_snapshot(layer, _WEIGHT_GLOBAL_SCALE, global_scale.reshape(1))
+        lut_handle = nvfp4_emulation_utils.kE2M1ToFloat_handle
+        if lut_handle.val.device != packed.device:
+            lut_handle.val = lut_handle.val.to(packed.device)
 
     def materialize(self, layer: torch.nn.Module) -> torch.Tensor:
-        packed = _required_snapshot(layer, _WEIGHT, "NVFP4 weight")
-        scale = _required_snapshot(layer, _WEIGHT_SCALE, "NVFP4 block scale")
-        global_scale = _required_snapshot(layer, _WEIGHT_GLOBAL_SCALE, "NVFP4 global scale")
-        return _dequantize_nvfp4_reference(packed, scale, global_scale[0])
+        output_size = int(layer.output_size_per_partition)
+        input_size = int(layer.input_size_per_partition)
+        output = torch.empty(
+            (output_size, input_size),
+            dtype=torch.bfloat16,
+            device=layer.weight.device,
+        )
+        self.materialize_into(output, layer)
+        return output
+
+    def materialize_into(
+        self,
+        target: torch.Tensor,
+        layer: torch.nn.Module,
+    ) -> None:
+        output_size = int(layer.output_size_per_partition)
+        input_size = int(layer.input_size_per_partition)
+        packed = layer.weight[:output_size, : input_size // 2]
+        if target.device.type != "cuda":
+            target.copy_(
+                nvfp4_emulation_utils.dequantize_to_dtype(
+                    packed,
+                    layer.weight_scale,
+                    layer.weight_global_scale,
+                    target.dtype,
+                    _NVFP4_BLOCK_SIZE,
+                    True,
+                )
+            )
+            return
+        _dequantize_nvfp4_into(
+            target,
+            packed,
+            layer.weight_scale,
+            layer.weight_global_scale,
+            output_size,
+            input_size,
+        )
 
 
-def _fp8_scale_is_supported(weight: torch.Tensor, scale: torch.Tensor) -> bool:
-    if all(dim == 1 for dim in scale.shape):
-        return True
-    return bool(scale.shape) and scale.shape[0] == weight.shape[0] and all(dim == 1 for dim in scale.shape[1:])
+def _nvfp4_lut(device: torch.device) -> torch.Tensor:
+    lut = _NVFP4_LUT_CACHE.get(device)
+    if lut is None:
+        lut = torch.tensor(
+            [
+                (-1.0 if code & 0x8 else 1.0) * _NVFP4_E2M1_VALUES[code & 0x7]
+                for code in range(16)
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
+        _NVFP4_LUT_CACHE[device] = lut
+    return lut
 
 
-def _dequantize_nvfp4_reference(
-    packed: torch.Tensor,
-    scale: torch.Tensor,
-    global_scale: torch.Tensor,
-) -> torch.Tensor:
-    """Unpack E2M1 values and apply unswizzled ModelOpt block scales."""
-    codes = torch.stack((packed & 0x0F, packed >> 4), dim=-1).reshape(packed.shape[0], -1).long()
-    lut = torch.tensor(
-        [
-            (-1.0 if code & 0x8 else 1.0) * _NVFP4_E2M1_VALUES[code & 0x7]
-            for code in range(16)
-        ],
-        dtype=torch.float32,
-        device=packed.device,
+@triton.jit
+def _nvfp4_dequant_kernel(
+    output,
+    packed_weight,
+    weight_scale,
+    weight_global_scale,
+    lut,
+    weight_stride,
+    scale_k_padded: tl.constexpr,
+    input_size: tl.constexpr,
+    output_size: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = index < output_size * (input_size // 16)
+    row = index // (input_size // 16)
+    group = index % (input_size // 16)
+    byte_offset = (
+        row[:, None] * weight_stride
+        + group[:, None] * 8
+        + tl.arange(0, 8)[None, :]
     )
-    values = lut[codes]
-    block_scales = scale.to(device=packed.device, dtype=torch.float32).repeat_interleave(
-        _NVFP4_BLOCK_SIZE,
-        dim=1,
+    packed = tl.load(packed_weight + byte_offset, mask=mask[:, None], other=0).to(tl.int32)
+    values = tl.interleave(
+        tl.load(lut + (packed & 0xF)),
+        tl.load(lut + ((packed >> 4) & 0xF)),
     )
-    return (values * block_scales * global_scale.float()).to(torch.bfloat16)
+    m_block = row // 128
+    m_inner = row % 128
+    scale_offset = (
+        ((((m_block * (scale_k_padded // 4) + group // 4) * 32 + (m_inner % 32)) * 4)
+        + (m_inner // 32))
+        * 4
+    ) + (group % 4)
+    scale = tl.load(weight_scale + scale_offset, mask=mask, other=0.0).to(tl.float32)
+    scale *= tl.load(weight_global_scale).to(tl.float32)
+    output_offset = (
+        row[:, None] * input_size
+        + group[:, None] * 16
+        + tl.arange(0, 16)[None, :]
+    )
+    tl.store(
+        output + output_offset,
+        values * scale[:, None],
+        mask=mask[:, None],
+    )
 
 
-def _register_snapshot(layer: torch.nn.Module, name: str, value: torch.Tensor) -> None:
-    layer.register_buffer(name, value.detach().clone(), persistent=False)
-
-
-def _required_snapshot(layer: torch.nn.Module, name: str, description: str) -> torch.Tensor:
-    value = getattr(layer, name, None)
-    if not isinstance(value, torch.Tensor):
-        raise RuntimeError(f"Missing Cosmos3 precision-schedule {description} snapshot")
-    return value
+def _dequantize_nvfp4_into(
+    target: torch.Tensor,
+    packed_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_global_scale: torch.Tensor,
+    output_size: int,
+    input_size: int,
+) -> None:
+    if output_size % 128 != 0 or input_size % 64 != 0:
+        raise ValueError(
+            "CUTLASS NVFP4 live dequantization requires output_size % 128 == 0 "
+            "and input_size % 64 == 0"
+        )
+    blocks = output_size * (input_size // _NVFP4_BLOCK_SIZE)
+    _nvfp4_dequant_kernel[(triton.cdiv(blocks, _NVFP4_DEQUANT_BLOCK),)](
+        target,
+        packed_weight,
+        weight_scale,
+        weight_global_scale,
+        _nvfp4_lut(target.device),
+        packed_weight.stride(0),
+        scale_k_padded=weight_scale.shape[-1],
+        input_size=input_size,
+        output_size=output_size,
+        BLOCK=_NVFP4_DEQUANT_BLOCK,
+    )
 
 
 def _validate_positive_finite_scale(scale: torch.Tensor, module_name: str) -> None:

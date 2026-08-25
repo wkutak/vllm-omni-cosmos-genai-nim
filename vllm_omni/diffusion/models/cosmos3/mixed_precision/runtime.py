@@ -12,7 +12,6 @@ from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
 
 from .cache import (
     Cosmos3BlockWeightStager,
-    Cosmos3DenseWeightCache,
     Cosmos3PrecisionLayerState,
 )
 from .config import Cosmos3MixedPrecisionConfig
@@ -59,8 +58,13 @@ class Cosmos3MixedPrecisionLinearMethod(LinearMethodBase):
         self.base_method.create_weights(*args, **kwargs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        self.strategy.snapshot_before_processing(layer, self.module_name)
+        self.strategy.validate_before_processing(
+            self.base_method,
+            layer,
+            self.module_name,
+        )
         self.base_method.process_weights_after_loading(layer)
+        self.strategy.validate_after_processing(layer, self.module_name)
         self.state = self.runtime.bind(self, layer)
 
     def apply(
@@ -94,9 +98,6 @@ class Cosmos3MixedPrecisionRuntime:
         self._generation_high_precision = False
         self._methods: list[Cosmos3MixedPrecisionLinearMethod] = []
         self._finalized = False
-        self._dense_cache = (
-            Cosmos3DenseWeightCache(activation_dtype) if config.cache == "full" else None
-        )
         self._block_stager = (
             Cosmos3BlockWeightStager(activation_dtype) if config.cache == "block" else None
         )
@@ -153,9 +154,7 @@ class Cosmos3MixedPrecisionRuntime:
             block_index=method.block_index,
             linear_index=method.linear_index,
         )
-        if self._dense_cache is not None:
-            self._dense_cache.register(layer, state, method.strategy)
-        elif self._block_stager is not None and method.path == "generation":
+        if self._block_stager is not None and method.path == "generation":
             self._block_stager.add(state, layer, method.strategy)
         return state
 

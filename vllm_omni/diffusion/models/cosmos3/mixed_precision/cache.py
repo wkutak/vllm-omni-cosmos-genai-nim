@@ -17,7 +17,6 @@ if TYPE_CHECKING:
     from .strategy import Cosmos3PrecisionStrategy
 
 PrecisionPath = Literal["reasoner", "generation"]
-_DENSE_WEIGHT_BUFFER = "_cosmos3_dense_a16_weight"
 
 
 @dataclass
@@ -37,29 +36,6 @@ class _BlockEntry:
     state: Cosmos3PrecisionLayerState
     layer: torch.nn.Module
     strategy: Cosmos3PrecisionStrategy
-
-
-class Cosmos3DenseWeightCache:
-    """Materialize one persistent dense device buffer per wrapped linear."""
-
-    def __init__(self, dtype: torch.dtype) -> None:
-        self.dtype = dtype
-
-    def register(
-        self,
-        layer: torch.nn.Module,
-        state: Cosmos3PrecisionLayerState,
-        strategy: Cosmos3PrecisionStrategy,
-    ) -> None:
-        weight = torch.empty(
-            (state.output_size, state.input_size),
-            dtype=self.dtype,
-            device=layer.weight.device,
-        )
-        with torch.no_grad():
-            strategy.materialize_into(weight, layer)
-        layer.register_buffer(_DENSE_WEIGHT_BUFFER, weight, persistent=False)
-        state.dense_weight = weight
 
 
 class Cosmos3BlockWeightStager:

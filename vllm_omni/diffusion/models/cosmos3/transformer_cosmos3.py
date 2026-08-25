@@ -1144,8 +1144,7 @@ class Cosmos3VFMTransformer(nn.Module):
             parallel_config = getattr(od_config, "parallel_config", None)
             if bool(getattr(parallel_config, "use_hsdp", False)):
                 raise ValueError(
-                    "Cosmos3 mixed precision is incompatible with HSDP because "
-                    "alternate-path snapshots are replicated module buffers"
+                    "Cosmos3 mixed precision has not validated live backend weights under HSDP"
                 )
             layerwise_offload = bool(
                 getattr(od_config, "enable_layerwise_offload", False)
@@ -1155,6 +1154,12 @@ class Cosmos3VFMTransformer(nn.Module):
             if mixed_precision_config.cache != "none" and layerwise_offload:
                 raise ValueError(
                     "Cosmos3 mixed-precision caches are incompatible with layer-wise offload"
+                )
+            if mixed_precision_config.cache == "block" and bool(
+                getattr(od_config, "enable_cpu_offload", False)
+            ):
+                raise ValueError(
+                    "Cosmos3 block caching is incompatible with model-level CPU offload"
                 )
 
         self.language_model = self._language_model_cls(

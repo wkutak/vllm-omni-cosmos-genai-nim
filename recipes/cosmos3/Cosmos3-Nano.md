@@ -127,15 +127,16 @@ vllm serve /path/to/Cosmos3-Nano-modelopt \
 ```
 
 The nested object's presence enables the schedule; use an empty object for
-on-demand materialization. Experimental `full` and `block` cache modes retain
-dense weights or stage generation blocks through two device buffers,
-respectively. They are incompatible with layer-wise offload and still require
+on-demand materialization. Experimental `cache:"block"` stages generation
+weights through two dense device buffers without retaining another full model
+weight set. It is incompatible with layer-wise offload and still requires
 performance and memory validation.
 This path currently requires tensor parallel size 1 and does not support HSDP
-or block-scaled FP8. Its PyTorch dequantization is a correctness baseline; no
-dequantization-kernel or weight-cache speedup is implied. Quantized reasoner
-weights use A16 by default; set `"reasoner":"native"` in the nested object to
-keep W8A8/W4A4.
+or block-scaled FP8. It keeps one live quantized weight representation:
+scheduled FP8 requires serialized tensorwise scales and a canonical backend,
+while scheduled NVFP4 requires CUTLASS. Its dequantization is a correctness
+baseline; no speedup is implied. Quantized reasoner weights use A16 by default;
+set `"reasoner":"native"` in the nested object to keep W8A8/W4A4.
 FP8 and NVFP4 are inferred independently from each ModelOpt linear method;
 BF16 linears are left unchanged.
 
