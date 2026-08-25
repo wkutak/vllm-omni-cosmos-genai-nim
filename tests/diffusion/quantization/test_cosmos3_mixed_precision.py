@@ -24,6 +24,23 @@ from vllm_omni.diffusion.models.cosmos3.mixed_precision.strategy import (
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
+def _swizzle_blockscale_cpu(scale: torch.Tensor) -> torch.Tensor:
+    rows, cols = scale.shape
+    padded_rows = ((rows + 127) // 128) * 128
+    padded_cols = ((cols + 3) // 4) * 4
+    padded = torch.zeros(
+        (1, padded_rows, padded_cols),
+        dtype=scale.dtype,
+        device=scale.device,
+    )
+    padded[0, :rows, :cols] = scale
+    padded = padded.reshape(1, padded_rows // 128, 4, 32, padded_cols // 4, 4)
+    return padded.permute(0, 1, 4, 3, 2, 5).contiguous().reshape(
+        padded_rows,
+        padded_cols,
+    )
+
+
 def test_config_parses_nested_schedule_and_reasoner_policy() -> None:
     config = Cosmos3MixedPrecisionConfig.from_additional_config(
         {
@@ -96,25 +113,34 @@ class _Layer(torch.nn.Module):
 
 
 class _BaseMethod:
-    def __init__(self, *, mutate: bool = False) -> None:
-        self.mutate = mutate
+    def __init__(self, *, nvfp4: bool = False) -> None:
         self.processed = False
         self.apply_calls = 0
+        self.fp8_linear = object()
+        self.kernel = (
+            type("CutlassNvFp4LinearKernel", (), {})()
+            if nvfp4
+            else None
+        )
 
     def create_weights(self, *args, **kwargs) -> None:
         pass
 
     def process_weights_after_loading(self, layer) -> None:
         self.processed = True
-        if self.mutate:
-            layer.weight = torch.zeros(1)
-            layer.weight_scale = torch.zeros(1)
+        if layer.weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            layer.weight = layer.weight.t().contiguous()
+            layer.weight_scale = layer.weight_scale.max().reshape(1)
+        elif layer.weight.dtype == torch.uint8:
+            layer.weight_scale = _swizzle_blockscale_cpu(layer.weight_scale)
+            layer.weight_global_scale = layer.weight_scale_2.max().float().reshape(1)
+            del layer.weight_scale_2
 
     def apply(self, layer, x, bias=None):
-        del layer, bias
+        del bias
         self.apply_calls += 1
         return torch.full(
-            (*x.shape[:-1], 2),
+            (*x.shape[:-1], layer.output_size_per_partition),
             17,
             dtype=x.dtype,
             device=x.device,
@@ -128,7 +154,7 @@ def _fp8_layer(output_size: int = 2, input_size: int = 4) -> _Layer:
     return layer
 
 
-def _nvfp4_layer(output_size: int = 2, input_size: int = 16) -> _Layer:
+def _nvfp4_layer(output_size: int = 128, input_size: int = 64) -> _Layer:
     layer = _Layer(output_size, input_size)
     layer.weight = torch.full((output_size, input_size // 2), 0x22, dtype=torch.uint8)
     layer.weight_scale = torch.ones(output_size, input_size // 16, dtype=torch.float8_e4m3fn)
@@ -142,7 +168,6 @@ def _runtime_and_method(
     *,
     path: str = "generation",
     reasoner: str = "native",
-    mutate: bool = False,
 ):
     config = Cosmos3MixedPrecisionConfig(
         first_steps=1,
@@ -150,7 +175,7 @@ def _runtime_and_method(
         reasoner=reasoner,
     )
     runtime = Cosmos3MixedPrecisionRuntime(config)
-    base = _BaseMethod(mutate=mutate)
+    base = _BaseMethod(nvfp4=isinstance(strategy, Nvfp4W4A4W4A16Strategy))
     method = Cosmos3MixedPrecisionLinearMethod(
         base,
         strategy,
@@ -174,7 +199,10 @@ def test_generation_dispatches_native_middle_and_a16_edges(strategy, layer) -> N
     x = torch.ones(1, layer.input_size_per_partition, dtype=torch.bfloat16)
 
     runtime.set_step(1, 3)
-    assert torch.equal(method.apply(layer, x), torch.full((1, 2), 17, dtype=x.dtype))
+    assert torch.equal(
+        method.apply(layer, x),
+        torch.full((1, layer.output_size_per_partition), 17, dtype=x.dtype),
+    )
     runtime.set_step(0, 3)
     assert torch.equal(
         method.apply(layer, x),
@@ -190,14 +218,11 @@ def test_generation_dispatches_native_middle_and_a16_edges(strategy, layer) -> N
         (Nvfp4W4A4W4A16Strategy(), _nvfp4_layer()),
     ],
 )
-def test_snapshot_precedes_native_backend_repacking(strategy, layer) -> None:
-    original = layer.weight.clone()
-    runtime, base, method = _runtime_and_method(strategy, layer, mutate=True)
+def test_a16_uses_only_live_native_weights(strategy, layer) -> None:
+    runtime, base, method = _runtime_and_method(strategy, layer)
     assert base.processed
-    assert torch.equal(
-        layer._cosmos3_precision_weight.view(torch.uint8),
-        original.view(torch.uint8),
-    )
+    assert not hasattr(layer, "_cosmos3_precision_weight")
+    assert not hasattr(layer, "_cosmos3_precision_weight_scale")
 
     runtime.set_step(0, 3)
     output = method.apply(
@@ -207,49 +232,47 @@ def test_snapshot_precedes_native_backend_repacking(strategy, layer) -> None:
     assert output.shape == (1, layer.output_size_per_partition)
 
 
-def test_snapshots_are_nonpersistent_buffers() -> None:
+def test_fp8_rejects_smoothquant() -> None:
     layer = _fp8_layer()
-    Fp8W8A8W8A16Strategy().snapshot_before_processing(layer, "gen.linear")
-    assert "_cosmos3_precision_weight" in dict(layer.named_buffers())
-    assert "_cosmos3_precision_weight" not in layer.state_dict()
-    assert "_cosmos3_precision_weight_scale" not in layer.state_dict()
+    layer.pre_quant_scale = torch.ones(1)
+    with pytest.raises(ValueError, match="SmoothQuant"):
+        Fp8W8A8W8A16Strategy().validate_before_processing(
+            _BaseMethod(),
+            layer,
+            "gen.linear",
+        )
 
 
-@pytest.mark.parametrize("scale_shape", [(2, 1, 4, 1), (1, 1, 8, 1)])
-def test_block_scaled_fp8_is_rejected(scale_shape: tuple[int, ...]) -> None:
-    layer = _fp8_layer(output_size=8, input_size=16)
-    layer.weight_scale = torch.ones(*scale_shape)
-    with pytest.raises(ValueError, match="block-scaled FP8"):
-        Fp8W8A8W8A16Strategy().snapshot_before_processing(layer, "gen.linear")
-
-
-def test_fp8_reference_materialization_supports_per_row_scales() -> None:
+def test_fp8_rejects_non_tensorwise_scales() -> None:
     layer = _fp8_layer(output_size=3, input_size=2)
     layer.weight_scale = torch.tensor([[1.0], [2.0], [3.0]])
-    strategy = Fp8W8A8W8A16Strategy()
-    strategy.snapshot_before_processing(layer, "gen.linear")
-    output = strategy.materialize(layer)
-    assert output[:, 0].tolist() == [1.0, 2.0, 3.0]
+    with pytest.raises(ValueError, match="tensorwise FP8"):
+        Fp8W8A8W8A16Strategy().validate_before_processing(
+            _BaseMethod(),
+            layer,
+            "gen.linear",
+        )
 
 
-def test_nvfp4_reference_materialization_unpacks_e2m1() -> None:
-    layer = _nvfp4_layer(output_size=1)
-    layer.weight[0, 0] = 0x21
-    layer.weight_scale.fill_(2.0)
-    layer.weight_scale_2.fill_(0.5)
+def test_nvfp4_reference_materializes_live_cutlass_weights() -> None:
+    layer = _nvfp4_layer()
     strategy = Nvfp4W4A4W4A16Strategy()
-    strategy.snapshot_before_processing(layer, "gen.linear")
+    _runtime_and_method(strategy, layer)
     output = strategy.materialize(layer)
-    assert output.shape == (1, 16)
-    assert output[0, :4].tolist() == [0.5, 1.0, 1.0, 1.0]
+    assert output.shape == (128, 64)
+    assert torch.equal(output, torch.ones_like(output))
 
 
 def test_nvfp4_rejects_fused_global_scales() -> None:
-    layer = _nvfp4_layer(output_size=3)
+    layer = _nvfp4_layer()
     layer.weight_scale_2 = torch.tensor([1.0, 2.0])
     strategy = Nvfp4W4A4W4A16Strategy()
-    with pytest.raises(ValueError, match="one NVFP4 global scale"):
-        strategy.snapshot_before_processing(layer, "gen.qkv")
+    with pytest.raises(ValueError, match="NVFP4 scales"):
+        strategy.validate_before_processing(
+            _BaseMethod(nvfp4=True),
+            layer,
+            "gen.qkv",
+        )
 
 
 @pytest.mark.parametrize(

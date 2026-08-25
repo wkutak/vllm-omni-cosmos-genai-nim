@@ -49,8 +49,13 @@ class Cosmos3MixedPrecisionLinearMethod(LinearMethodBase):
         self.base_method.create_weights(*args, **kwargs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        self.strategy.snapshot_before_processing(layer, self.module_name)
+        self.strategy.validate_before_processing(
+            self.base_method,
+            layer,
+            self.module_name,
+        )
         self.base_method.process_weights_after_loading(layer)
+        self.strategy.validate_after_processing(layer, self.module_name)
 
     def apply(
         self,

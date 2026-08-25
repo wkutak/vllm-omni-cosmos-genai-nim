@@ -215,10 +215,12 @@ The schedule supports serialized ModelOpt FP8 and NVFP4 checkpoints:
 | FP8 | W8A8 | W8A16 |
 | NVFP4 | W4A4 | W4A16 |
 
-The implementation snapshots canonical quantized tensors before the native
-backend may transpose or repack them. The A16 path then uses straightforward
-PyTorch dequantization and `F.linear`. It is a correctness baseline, not a
-dequantization or caching performance optimization.
+The native and A16 paths share one quantized weight representation. The A16
+path dequantizes the live backend weight and calls `F.linear`; it does not keep
+a second checkpoint-weight snapshot. Scheduled FP8 currently requires
+serialized tensorwise scales and a backend that retains canonical FP8 weights.
+Scheduled NVFP4 currently requires the CUTLASS live layout. SmoothQuant,
+Marlin-repacked FP8, and per-channel/per-token FP8 schedules fail closed.
 
 The reasoner uses dense A16 execution by default when its weights are FP8 or
 NVFP4. Set the nested `reasoner` field to `native` to retain the checkpoint-native
