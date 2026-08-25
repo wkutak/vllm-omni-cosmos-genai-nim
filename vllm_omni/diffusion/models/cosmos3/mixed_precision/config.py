@@ -10,9 +10,11 @@ from dataclasses import dataclass
 from typing import Literal, cast
 
 ReasonerPolicy = Literal["native", "a16"]
+CacheMode = Literal["none", "full", "block"]
 
 _REASONER_POLICIES = frozenset({"native", "a16"})
-_CONFIG_FIELDS = frozenset({"first_steps", "last_steps", "reasoner"})
+_CACHE_MODES = frozenset({"none", "full", "block"})
+_CONFIG_FIELDS = frozenset({"first_steps", "last_steps", "reasoner", "cache"})
 
 
 @dataclass(frozen=True)
@@ -22,6 +24,7 @@ class Cosmos3MixedPrecisionConfig:
     first_steps: int = 3
     last_steps: int = 3
     reasoner: ReasonerPolicy = "a16"
+    cache: CacheMode = "none"
 
     @classmethod
     def from_additional_config(
@@ -54,10 +57,17 @@ class Cosmos3MixedPrecisionConfig:
                 "cosmos3_mixed_precision.reasoner must be one of "
                 f"{sorted(_REASONER_POLICIES)}, got {reasoner!r}"
             )
+        cache = str(raw_config.get("cache", "none")).lower()
+        if cache not in _CACHE_MODES:
+            raise ValueError(
+                "cosmos3_mixed_precision.cache must be one of "
+                f"{sorted(_CACHE_MODES)}, got {cache!r}"
+            )
         return cls(
             first_steps=first_steps,
             last_steps=last_steps,
             reasoner=cast(ReasonerPolicy, reasoner),
+            cache=cast(CacheMode, cache),
         )
 
     def use_high_precision(self, step_index: int, num_steps: int) -> bool:

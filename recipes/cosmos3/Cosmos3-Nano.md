@@ -123,11 +123,14 @@ and dense W8A16/W4A16 in the first and last steps:
 vllm serve /path/to/Cosmos3-Nano-modelopt \
   --omni \
   --additional-config \
-  '{"cosmos3_mixed_precision":{"first_steps":3,"last_steps":3,"reasoner":"a16"}}'
+  '{"cosmos3_mixed_precision":{"first_steps":3,"last_steps":3,"reasoner":"a16","cache":"block"}}'
 ```
 
 The nested object's presence enables the schedule; use an empty object for
-these defaults.
+on-demand materialization. Experimental `full` and `block` cache modes retain
+dense weights or stage generation blocks through two device buffers,
+respectively. They are incompatible with layer-wise offload and still require
+performance and memory validation.
 This path currently requires tensor parallel size 1 and does not support HSDP
 or block-scaled FP8. Its PyTorch dequantization is a correctness baseline; no
 dequantization-kernel or weight-cache speedup is implied. Quantized reasoner

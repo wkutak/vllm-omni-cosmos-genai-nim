@@ -1147,6 +1147,15 @@ class Cosmos3VFMTransformer(nn.Module):
                     "Cosmos3 mixed precision is incompatible with HSDP because "
                     "alternate-path snapshots are replicated module buffers"
                 )
+            layerwise_offload = bool(
+                getattr(od_config, "enable_layerwise_offload", False)
+            ) or bool(
+                getattr(od_config, "enable_distributed_layerwise_offload", False)
+            )
+            if mixed_precision_config.cache != "none" and layerwise_offload:
+                raise ValueError(
+                    "Cosmos3 mixed-precision caches are incompatible with layer-wise offload"
+                )
 
         self.language_model = self._language_model_cls(
             hidden_size=self.hidden_size,
@@ -1208,7 +1217,10 @@ class Cosmos3VFMTransformer(nn.Module):
 
         self.mixed_precision_runtime: Cosmos3MixedPrecisionRuntime | None = None
         if mixed_precision_config is not None:
-            self.mixed_precision_runtime = Cosmos3MixedPrecisionRuntime(mixed_precision_config)
+            self.mixed_precision_runtime = Cosmos3MixedPrecisionRuntime(
+                mixed_precision_config,
+                activation_dtype=dtype,
+            )
             self.mixed_precision_runtime.install(self)
 
         self.norm_moe_gen = RMSNorm(self.hidden_size, eps=self.rms_norm_eps)

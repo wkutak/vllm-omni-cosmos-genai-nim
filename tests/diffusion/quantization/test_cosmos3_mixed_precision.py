@@ -12,6 +12,10 @@ from vllm_omni.diffusion.models.cosmos3.mixed_precision import (
     Cosmos3MixedPrecisionConfig,
     Cosmos3MixedPrecisionRuntime,
 )
+from vllm_omni.diffusion.models.cosmos3.mixed_precision.cache import (
+    Cosmos3BlockWeightStager,
+    Cosmos3PrecisionLayerState,
+)
 from vllm_omni.diffusion.models.cosmos3.mixed_precision import runtime as runtime_impl
 from vllm_omni.diffusion.models.cosmos3.mixed_precision.runtime import (
     Cosmos3MixedPrecisionLinearMethod,
@@ -31,12 +35,14 @@ def test_config_parses_nested_schedule_and_reasoner_policy() -> None:
                 "first_steps": 2,
                 "last_steps": 4,
                 "reasoner": "native",
+                "cache": "full",
             }
         }
     )
 
     assert config is not None
     assert config.reasoner == "native"
+    assert config.cache == "full"
     assert [index for index in range(10) if config.use_high_precision(index, 10)] == [0, 1, 6, 7, 8, 9]
 
 
@@ -72,6 +78,7 @@ def test_one_step_request_honors_boundary_precision() -> None:
         ({"cosmos3_mixed_precision": True}, "must be a mapping"),
         ({"cosmos3_mixed_precision": {"first_steps": -1}}, "non-negative"),
         ({"cosmos3_mixed_precision": {"reasoner": "fp16"}}, "must be one of"),
+        ({"cosmos3_mixed_precision": {"cache": "disk"}}, "must be one of"),
         ({"cosmos3_mixed_precision": {"unknown": 1}}, "Unknown"),
     ],
 )
@@ -143,11 +150,13 @@ def _runtime_and_method(
     path: str = "generation",
     reasoner: str = "native",
     mutate: bool = False,
+    cache: str = "none",
 ):
     config = Cosmos3MixedPrecisionConfig(
         first_steps=1,
         last_steps=1,
         reasoner=reasoner,
+        cache=cache,
     )
     runtime = Cosmos3MixedPrecisionRuntime(config)
     base = _BaseMethod(mutate=mutate)
@@ -157,6 +166,8 @@ def _runtime_and_method(
         runtime,
         f"{path}.linear",
         path,
+        0,
+        0,
     )
     method.process_weights_after_loading(layer)
     return runtime, base, method
@@ -181,6 +192,76 @@ def test_generation_dispatches_native_middle_and_a16_edges(strategy, layer) -> N
         torch.nn.functional.linear(x, strategy.materialize(layer)),
     )
     assert base.apply_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("strategy", "layer"),
+    [
+        (Fp8W8A8W8A16Strategy(), _fp8_layer()),
+        (Nvfp4W4A4W4A16Strategy(), _nvfp4_layer()),
+    ],
+)
+def test_full_cache_reuses_nonpersistent_dense_weight(strategy, layer) -> None:
+    runtime, _, method = _runtime_and_method(strategy, layer, cache="full")
+    assert method.state is not None
+    dense_weight = method.state.dense_weight
+    assert dense_weight is not None
+    assert "_cosmos3_dense_a16_weight" not in layer.state_dict()
+
+    runtime.set_step(0, 3)
+    x = torch.ones(1, layer.input_size_per_partition, dtype=torch.bfloat16)
+    first = method.apply(layer, x)
+    second = method.apply(layer, x)
+    assert torch.equal(first, second)
+    assert method.state.dense_weight.data_ptr() == dense_weight.data_ptr()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_block_cache_double_buffers_generation_blocks() -> None:
+    class _Block(torch.nn.Module):
+        def __init__(self, state: Cosmos3PrecisionLayerState) -> None:
+            super().__init__()
+            self.state = state
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            assert self.state.dense_weight is not None
+            return torch.nn.functional.linear(value, self.state.dense_weight)
+
+    strategy = Fp8W8A8W8A16Strategy()
+    states = [
+        Cosmos3PrecisionLayerState(
+            module_name=f"generation.{index}.linear",
+            path="generation",
+            input_size=2,
+            output_size=2,
+            block_index=index,
+            linear_index=0,
+        )
+        for index in range(2)
+    ]
+    layers = []
+    blocks = []
+    stager = Cosmos3BlockWeightStager(torch.bfloat16)
+    for state in states:
+        layer = _fp8_layer(output_size=2, input_size=2)
+        layer.weight = layer.weight.cuda()
+        layer.weight_scale = layer.weight_scale.cuda()
+        strategy.snapshot_before_processing(layer, state.module_name)
+        layers.append(layer)
+        blocks.append(_Block(state).cuda())
+        stager.add(state, layer, strategy)
+    stager.install(blocks, lambda: True)
+    stager.initialize()
+
+    pointers = [state.dense_weight.data_ptr() for state in states]
+    value = torch.ones(1, 2, dtype=torch.bfloat16, device="cuda")
+    for _ in range(2):
+        output = value
+        for block in blocks:
+            output = block(output)
+        assert torch.equal(output, value)
+    assert [state.dense_weight.data_ptr() for state in states] == pointers
+    stager.reset()
 
 
 @pytest.mark.parametrize(

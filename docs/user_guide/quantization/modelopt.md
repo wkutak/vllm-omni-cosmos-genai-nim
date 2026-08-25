@@ -230,11 +230,14 @@ support block-scaled FP8.
 vllm serve /path/to/Cosmos3-Nano-modelopt \
   --omni \
   --additional-config \
-  '{"cosmos3_mixed_precision":{"first_steps":3,"last_steps":3,"reasoner":"a16"}}'
+  '{"cosmos3_mixed_precision":{"first_steps":3,"last_steps":3,"reasoner":"a16","cache":"block"}}'
 ```
 
 The presence of `cosmos3_mixed_precision` enables the schedule; an empty object
-uses the defaults shown above.
+uses on-demand materialization. Set `cache` to `full` for per-linear dense
+device weights or `block` for two-buffer generation-block staging. These
+experimental cache modes are incompatible with layer-wise offload and require
+performance and memory validation before production use.
 The runtime infers FP8 or NVFP4 independently for every ModelOpt linear method,
 so mixed checkpoints require no format selection. BF16 linears are untouched.
 

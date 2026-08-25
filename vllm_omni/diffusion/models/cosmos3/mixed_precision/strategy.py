@@ -49,16 +49,27 @@ class Cosmos3PrecisionStrategy:
         """Materialize the captured weight as a dense BF16 matrix."""
         raise NotImplementedError
 
+    def materialize_into(
+        self,
+        target: torch.Tensor,
+        layer: torch.nn.Module,
+    ) -> None:
+        """Reference fill for a preallocated cache or staging view."""
+        target.copy_(self.materialize(layer))
+
     def apply_high(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None,
+        *,
+        weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply the reference dense A16 path."""
         input_size = int(layer.input_size_per_partition)
         output_size = int(layer.output_size_per_partition)
-        weight = self.materialize(layer)
+        if weight is None:
+            weight = self.materialize(layer)
         expected_shape = (output_size, input_size)
         if tuple(weight.shape) != expected_shape:
             raise RuntimeError(f"Dense weight shape {tuple(weight.shape)} does not match {expected_shape}")
