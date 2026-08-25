@@ -233,7 +233,7 @@ def main() -> None:
         "cosmos3_mixed_precision_first_steps": args.first_steps,
         "cosmos3_mixed_precision_last_steps": args.last_steps,
         "cosmos3_mixed_precision_reasoner_policy": args.reasoner_policy,
-        "cosmos3_mixed_precision_w8a16_cache": args.w8a16_cache,
+        "cosmos3_mixed_precision_dense_weight_cache": args.w8a16_cache,
     }
 
     print(

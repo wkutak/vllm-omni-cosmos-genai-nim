@@ -14,7 +14,6 @@ from vllm_omni.diffusion.models.cosmos3 import mixed_precision as mixed_precisio
 from vllm_omni.diffusion.models.cosmos3.mixed_precision import (
     Cosmos3MixedPrecisionConfig,
     Cosmos3MixedPrecisionRuntime,
-    Fp8W8A8W8A16Strategy,
     create_cosmos3_precision_strategy,
 )
 from vllm_omni.diffusion.models.cosmos3.mixed_precision import runtime as runtime_impl
@@ -34,6 +33,8 @@ from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
+Fp8W8A8W8A16Strategy = fp8_strategy_impl.Fp8W8A8W8A16Strategy
+
 
 def test_package_does_not_export_implementation_classes() -> None:
     implementation_classes = {
@@ -45,6 +46,7 @@ def test_package_does_not_export_implementation_classes() -> None:
         "DenseBlockWeightProvider",
         "GpuBlockWeightProvider",
         "GpuW8A16BlockWeightProvider",
+        "Fp8W8A8W8A16Strategy",
         "W8A16BlockEntry",
         "W8A16BlockWeightProvider",
     }
@@ -76,13 +78,13 @@ def test_config_parses_asymmetric_schedule_and_reasoner_policy() -> None:
             "cosmos3_mixed_precision_first_steps": 2,
             "cosmos3_mixed_precision_last_steps": 4,
             "cosmos3_mixed_precision_reasoner_policy": "base_precision",
-            "cosmos3_mixed_precision_w8a16_cache": "all",
+            "cosmos3_mixed_precision_dense_weight_cache": "all",
         }
     )
 
     assert config.enabled
     assert config.reasoner_policy == "base_precision"
-    assert config.w8a16_cache == "all"
+    assert config.dense_weight_cache == "all"
     selected = [index for index in range(10) if config.use_high_precision(index, 10)]
     assert selected == [0, 1, 6, 7, 8, 9]
 
@@ -120,7 +122,7 @@ def test_one_step_engine_execution_uses_base_precision() -> None:
         ({"cosmos3_mixed_precision_format": "nvfp4"}, "must be one of"),
         ({"cosmos3_mixed_precision_first_steps": -1}, "non-negative"),
         ({"cosmos3_mixed_precision_reasoner_policy": "fp16"}, "must be one of"),
-        ({"cosmos3_mixed_precision_w8a16_cache": "disk"}, "must be one of"),
+        ({"cosmos3_mixed_precision_dense_weight_cache": "disk"}, "must be one of"),
     ],
 )
 def test_config_rejects_invalid_values(values: dict, message: str) -> None:
@@ -130,13 +132,15 @@ def test_config_rejects_invalid_values(values: dict, message: str) -> None:
 
 @pytest.mark.parametrize("cache_mode", ["gpu_block", "cpu_block"])
 def test_config_accepts_block_cache_modes(cache_mode: str) -> None:
-    config = Cosmos3MixedPrecisionConfig.from_additional_config({"cosmos3_mixed_precision_w8a16_cache": cache_mode})
-    assert config.w8a16_cache == cache_mode
+    config = Cosmos3MixedPrecisionConfig.from_additional_config(
+        {"cosmos3_mixed_precision_dense_weight_cache": cache_mode}
+    )
+    assert config.dense_weight_cache == cache_mode
 
 
 def test_config_defaults_to_bounded_gpu_block_cache() -> None:
     config = Cosmos3MixedPrecisionConfig.from_additional_config({})
-    assert config.w8a16_cache == "gpu_block"
+    assert config.dense_weight_cache == "gpu_block"
 
 
 def _modelopt_fp8_config(
@@ -173,7 +177,7 @@ def test_serialized_cosmos3_fp8_defaults_to_mixed_precision(
     assert config.enabled
     assert config.first_steps == 3
     assert config.last_steps == 3
-    assert config.w8a16_cache == "gpu_block"
+    assert config.dense_weight_cache == "gpu_block"
     assert od_config.force_cutlass_fp8
     assert "Automatically enabling CUTLASS FP8 kernels" in caplog.text
 
@@ -360,7 +364,7 @@ def _runtime_and_method(
         first_steps=1,
         last_steps=1,
         reasoner_policy=reasoner_policy,  # type: ignore[arg-type]
-        w8a16_cache=cache_mode,  # type: ignore[arg-type]
+        dense_weight_cache=cache_mode,  # type: ignore[arg-type]
     )
     strategy = Fp8W8A8W8A16Strategy(
         cache_mode=cache_mode,  # type: ignore[arg-type]

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import importlib
+import pkgutil
 from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
@@ -26,11 +27,20 @@ class StrategyFactory(Protocol):
     ) -> Cosmos3PrecisionStrategy: ...
 
 
-# Adding a format requires its strategy module plus one auditable registration
-# here. Configuration validation and factory dispatch both derive from this map.
-_STRATEGY_MODULES = {
-    "fp8": ".strategies.fp8",
-}
+def _discover_strategy_modules() -> dict[str, str]:
+    """Discover strategy modules by filename without importing them."""
+    package = importlib.import_module(".strategies", package=__package__)
+    return {
+        module.name: f".strategies.{module.name}"
+        for module in pkgutil.iter_modules(package.__path__)
+        if not module.ispkg and not module.name.startswith("_")
+    }
+
+
+# A strategy is added by placing ``<format>.py`` under ``strategies`` and
+# exposing ``create_strategy`` from that module. Common configuration and
+# factory dispatch both derive from the discovered filenames.
+_STRATEGY_MODULES = _discover_strategy_modules()
 
 MIXED_PRECISION_FORMATS = frozenset({"none", *_STRATEGY_MODULES})
 

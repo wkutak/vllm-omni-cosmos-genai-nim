@@ -21,7 +21,6 @@ DenseWeightCacheMode = Literal[
     "cpu_block",
     "gpu_block",
 ]
-W8A16CacheMode = DenseWeightCacheMode
 
 REASONER_POLICIES = frozenset({"high_precision", "base_precision"})
 DENSE_WEIGHT_CACHE_MODES = frozenset(
@@ -33,7 +32,6 @@ DENSE_WEIGHT_CACHE_MODES = frozenset(
         "gpu_block",
     }
 )
-W8A16_CACHE_MODES = DENSE_WEIGHT_CACHE_MODES
 
 
 @dataclass(frozen=True)
@@ -44,9 +42,7 @@ class Cosmos3MixedPrecisionConfig:
     first_steps: int = 3
     last_steps: int = 3
     reasoner_policy: ReasonerPolicy = "high_precision"
-    # Retain the original field and additional_config spelling for API
-    # compatibility. Strategies should use dense_weight_cache below.
-    w8a16_cache: DenseWeightCacheMode = "gpu_block"
+    dense_weight_cache: DenseWeightCacheMode = "gpu_block"
 
     @classmethod
     def from_additional_config(
@@ -83,15 +79,16 @@ class Cosmos3MixedPrecisionConfig:
                 f"{sorted(REASONER_POLICIES)}, got {reasoner_policy!r}"
             )
 
-        w8a16_cache = str(
+        dense_weight_cache = str(
             values.get(
-                "cosmos3_mixed_precision_w8a16_cache",
+                "cosmos3_mixed_precision_dense_weight_cache",
                 "gpu_block",
             )
         ).lower()
-        if w8a16_cache not in W8A16_CACHE_MODES:
+        if dense_weight_cache not in DENSE_WEIGHT_CACHE_MODES:
             raise ValueError(
-                f"cosmos3_mixed_precision_w8a16_cache must be one of {sorted(W8A16_CACHE_MODES)}, got {w8a16_cache!r}"
+                "cosmos3_mixed_precision_dense_weight_cache must be one of "
+                f"{sorted(DENSE_WEIGHT_CACHE_MODES)}, got {dense_weight_cache!r}"
             )
 
         return cls(
@@ -99,13 +96,8 @@ class Cosmos3MixedPrecisionConfig:
             first_steps=first_steps,
             last_steps=last_steps,
             reasoner_policy=reasoner_policy,  # type: ignore[arg-type]
-            w8a16_cache=w8a16_cache,  # type: ignore[arg-type]
+            dense_weight_cache=dense_weight_cache,  # type: ignore[arg-type]
         )
-
-    @property
-    def dense_weight_cache(self) -> DenseWeightCacheMode:
-        """Return the format-neutral dense-weight cache selection."""
-        return self.w8a16_cache
 
     @property
     def enabled(self) -> bool:

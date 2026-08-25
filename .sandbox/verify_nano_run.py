@@ -70,7 +70,7 @@ def main() -> None:
     assert mixed["cosmos3_mixed_precision_first_steps"] == args.first_steps
     assert mixed["cosmos3_mixed_precision_last_steps"] == args.last_steps
     assert mixed["cosmos3_mixed_precision_reasoner_policy"] == args.reasoner_policy
-    assert mixed["cosmos3_mixed_precision_w8a16_cache"] == args.w8a16_cache
+    assert mixed["cosmos3_mixed_precision_dense_weight_cache"] == args.w8a16_cache
     assert sampling == request["sampling"]
     assert request["negative_prompt"] is None
 

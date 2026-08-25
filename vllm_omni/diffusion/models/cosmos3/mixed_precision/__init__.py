@@ -64,8 +64,8 @@ Flow elements
    before any transformer calls for that step. Conditional, unconditional, and
    other CFG branches therefore share the same selection.
 5. **Linear dispatch.** A lightweight wrapper sends each call to the strategy's
-   base or precise path. The runtime does not know whether that means FP8,
-   dense BF16, unpacking, or a future specialized kernel.
+   base or precise path. The runtime does not know which quantized, dense, or
+   specialized arithmetic implements either path.
 6. **Request completion.** A ``finally`` boundary records the executed
    precision trace, synchronizes outstanding staging work, and lets the
    strategy release request-scoped resources before output transfer.
@@ -112,11 +112,9 @@ from .config import (
     MixedPrecisionFormat,
     PrecisionPath,
     ReasonerPolicy,
-    W8A16CacheMode,
 )
 from .registry import create_cosmos3_precision_strategy
 from .runtime import Cosmos3MixedPrecisionRuntime
-from .strategies.fp8 import Fp8W8A8W8A16Strategy
 from .strategy import Cosmos3PrecisionStrategy
 
 __all__ = [
@@ -124,10 +122,8 @@ __all__ = [
     "Cosmos3MixedPrecisionRuntime",
     "Cosmos3PrecisionStrategy",
     "DenseWeightCacheMode",
-    "Fp8W8A8W8A16Strategy",
     "MixedPrecisionFormat",
     "PrecisionPath",
     "ReasonerPolicy",
-    "W8A16CacheMode",
     "create_cosmos3_precision_strategy",
 ]

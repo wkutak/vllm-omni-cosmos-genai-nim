@@ -40,7 +40,7 @@ RUN python3 -c "\
 from vllm.model_executor.kernels.linear.scaled_mm.cutlass import CutlassFP8ScaledMMLinearKernel; \
 from vllm.model_executor.kernels.linear.scaled_mm.marlin import MarlinFP8ScaledMMLinearKernel; \
 from vllm.model_executor.layers.quantization.modelopt import ModelOptFp8LinearMethod; \
-from vllm_omni.diffusion.models.cosmos3.mixed_precision import Fp8W8A8W8A16Strategy; \
+from vllm_omni.diffusion.models.cosmos3.mixed_precision.strategies.fp8 import Fp8W8A8W8A16Strategy; \
 print('verified:', ModelOptFp8LinearMethod.__name__, CutlassFP8ScaledMMLinearKernel.__name__, \
 MarlinFP8ScaledMMLinearKernel.__name__, Fp8W8A8W8A16Strategy.__name__)"
 

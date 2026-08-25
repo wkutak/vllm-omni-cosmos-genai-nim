@@ -247,7 +247,7 @@ vllm serve <serialized-cosmos3-modelopt-fp8-checkpoint> \
     "cosmos3_mixed_precision_first_steps":2,
     "cosmos3_mixed_precision_last_steps":4,
     "cosmos3_mixed_precision_reasoner_policy":"high_precision",
-    "cosmos3_mixed_precision_w8a16_cache":"gpu_block"
+    "cosmos3_mixed_precision_dense_weight_cache":"gpu_block"
   }'
 ```
 
@@ -257,7 +257,7 @@ vllm serve <serialized-cosmos3-modelopt-fp8-checkpoint> \
 | `cosmos3_mixed_precision_first_steps` | non-negative integer | `3` | Number of initial denoising steps using W8A16. |
 | `cosmos3_mixed_precision_last_steps` | non-negative integer | `3` | Number of final denoising steps using W8A16. Overlap selects W8A16 once. |
 | `cosmos3_mixed_precision_reasoner_policy` | `high_precision`, `base_precision` | `high_precision` | Selects W8A16 or the checkpoint's W8A8 method for the pre-denoising reasoner path. |
-| `cosmos3_mixed_precision_w8a16_cache` | `gpu_block`, `cpu_block`, `none`, `generation`, `all` | `gpu_block` | Selects where dense 16-bit weights are staged or retained. |
+| `cosmos3_mixed_precision_dense_weight_cache` | `gpu_block`, `cpu_block`, `none`, `generation`, `all` | `gpu_block` | Selects where the strategy's dense activation-precision weights are staged or retained. |
 
 Cache modes trade memory for staging work:
 

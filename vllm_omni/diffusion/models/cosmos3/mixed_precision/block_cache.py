@@ -376,7 +376,7 @@ class CpuBlockWeightProvider(DenseBlockWeightProvider):
 
     @torch.compiler.disable
     def preload_first(self) -> None:
-        """Rebuild an evicted host source only when W8A16 is requested again."""
+        """Rebuild an evicted host source only for another precise pass."""
         # reset() drops the source so decoded-video D2H allocation does not
         # compete with roughly a full generation cache of pinned weights.
         if self._initialized and not self._host_blocks:

@@ -105,7 +105,7 @@ def main() -> None:
     assert mixed["cosmos3_mixed_precision_first_steps"] == args.first_steps
     assert mixed["cosmos3_mixed_precision_last_steps"] == args.last_steps
     assert mixed["cosmos3_mixed_precision_reasoner_policy"] == args.reasoner_policy
-    assert mixed["cosmos3_mixed_precision_w8a16_cache"] == args.w8a16_cache
+    assert mixed["cosmos3_mixed_precision_dense_weight_cache"] == args.w8a16_cache
     assert manifest["quantization_mode"] == args.quantization_mode
     assert manifest["linear_backend"] == args.linear_backend
     assert sampling == request["sampling"]
