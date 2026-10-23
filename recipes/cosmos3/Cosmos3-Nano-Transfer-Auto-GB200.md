@@ -154,6 +154,13 @@ VLLM_OMNI_USE_QUACK_FP8=0 vllm serve /path/to/transfer-auto-modelopt-fp8 \
   '{"cosmos3_mixed_precision":{"first_steps":3,"last_steps":3,"reasoner":"a16"}}'
 ```
 
+Long multiview renders can exceed the executor's 600-second request timeout.
+Set `VLLM_OMNI_DLO_DP_WAVE_TIMEOUT` to a suitable whole-request budget in seconds
+before starting the server or importing `Omni`. For example,
+`VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=10800` permits three hours per request; this does
+not change denoising steps or numerical behavior. Async output users can also
+set `VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT` to the same budget.
+
 Use the same `additional_config` dictionary with the public `Omni` Python API.
 W8A16's `first_steps` must cover the actual request length; a longer request
 without updating it would enable native W8A8 in the remaining steps.
