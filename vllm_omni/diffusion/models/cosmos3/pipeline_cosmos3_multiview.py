@@ -339,7 +339,9 @@ def get_cosmos3_multiview_post_process_func(od_config: OmniDiffusionConfig):
 
     video_processor = VideoProcessor(vae_scale_factor=16)
 
-    def post_process_func(output: dict[str, Any], output_type: str = "np", sampling_params=None):
+    def post_process_func(output: dict[str, Any], output_type: str | None = None, sampling_params=None):
+        if output_type is None:
+            output_type = (sampling_params.output_type if sampling_params is not None else None) or "np"
         if output_type == "latent":
             return output
 

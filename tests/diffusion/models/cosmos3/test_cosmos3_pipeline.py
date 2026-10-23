@@ -4790,3 +4790,127 @@ def test_multiview_decodes_only_the_replica_output_owner(
     else:
         assert result.output is None
         assert decoded == []
+
+
+@pytest.mark.parametrize("output_type", ["np", "pt", "pil"])
+def test_multiview_postprocess_honors_request_output_type(output_type) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        get_cosmos3_multiview_post_process_func,
+    )
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    postprocess = get_cosmos3_multiview_post_process_func(SimpleNamespace(model_config={"guardrails": False}))
+    payload = {
+        "payload": {"video": torch.zeros(1, 3, 6, 4, 4)},
+        "metadata": {"multiview": {"cameras": ["front", "rear"], "frames_per_view": 3}},
+    }
+    result = postprocess(payload, sampling_params=OmniDiffusionSamplingParams(output_type=output_type))
+    video = result["payload"]["video"]
+    if output_type == "pil":
+        assert isinstance(video, list) and isinstance(video[0][0], Image.Image)
+    elif output_type == "pt":
+        assert isinstance(video, torch.Tensor) and video.shape == (1, 6, 3, 4, 4)
+    else:
+        assert isinstance(video, np.ndarray) and video.shape == (1, 6, 4, 4, 3)
+
+
+@pytest.mark.parametrize("output_type", ["np", "pil"])
+def test_multiview_cpu_worker_transport_engine_route_releases_raw_video(monkeypatch, output_type) -> None:
+    import gc
+    from multiprocessing import shared_memory
+    from typing import cast
+
+    from vllm_omni.diffusion import ipc
+    from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        get_cosmos3_multiview_post_process_func,
+    )
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    monkeypatch.setattr(ipc, "_SHM_TENSOR_THRESHOLD", 1)
+    monkeypatch.setattr(torch.accelerator, "current_stream", lambda: pytest.fail("CPU output accessed accelerator"))
+    config = SimpleNamespace(model_class_name="Cosmos3MultiviewPipeline", model_config={"guardrails": False})
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = config
+    engine.post_process_func = get_cosmos3_multiview_post_process_func(config)
+    engine._post_process_accepts_sampling_params = True
+    runner = object.__new__(DiffusionModelRunner)
+    params = OmniDiffusionSamplingParams(output_type=output_type)
+    request = OmniDiffusionRequest(prompt="", request_id="route", sampling_params=params)
+    cameras = [f"camera{i}" for i in range(7)]
+    source = torch.linspace(-1, 1, 7).repeat_interleave(3).view(1, 1, 21, 1, 1).expand(1, 3, 21, 4, 4)
+    lidar = torch.arange(36, dtype=torch.float32).reshape(1, 3, 2, 3, 2)
+    previous = None
+    for _ in range(2):
+        raw = source.clone()
+        worker_raw = weakref.ref(raw)
+        worker_storage = weakref.ref(raw.untyped_storage())
+        output = DiffusionOutput(
+            output={
+                "payload": {"video": raw, "lidar": lidar.clone()},
+                "metadata": {"multiview": {"cameras": cameras, "frames_per_view": 3}},
+            }
+        )
+        del raw
+        assert runner._prepare_output_for_transport(output, params) is output
+        ipc.pack_diffusion_output_shm(output, d2h_stream=cast(torch.Stream, object()))
+        gc.collect()
+        assert worker_raw() is None  # Packing committed handles before enqueue.
+        assert worker_storage() is None
+        names = [output.output["payload"][key]["name"] for key in ("video", "lidar")]
+        ipc.unpack_diffusion_output_shm(output)
+        for name in names:
+            with pytest.raises(FileNotFoundError):
+                shared_memory.SharedMemory(name=name)
+        consumer_raw = weakref.ref(output.output["payload"]["video"])
+        consumer_storage = weakref.ref(output.output["payload"]["video"].untyped_storage())
+        [formatted] = engine.postprocess_output(request, output)
+        images = formatted.images[0]
+        if output_type == "pil":
+            assert isinstance(images, list) and all(isinstance(image, Image.Image) for image in images)
+            pixels = np.stack([np.asarray(image) for image in images])[None]
+            assert pixels.dtype == np.uint8 and pixels.shape == (1, 21, 4, 4, 3)
+        else:
+            pixels = np.asarray(images)
+            assert pixels.dtype == np.float32 and pixels.shape == (1, 21, 4, 4, 3)
+        torch.testing.assert_close(formatted.multimodal_output["lidar"], lidar, rtol=0, atol=0)
+        assert formatted.multimodal_output["metadata"]["multiview"]["cameras"] == cameras
+        if previous is not None:
+            np.testing.assert_array_equal(pixels, previous)
+        previous = pixels.copy()
+        del output
+        gc.collect()
+        assert consumer_raw() is None  # Formatted PIL/NumPy output retains no raw F32 video.
+        assert consumer_storage() is None
+
+
+@pytest.mark.parametrize(
+    ("explicit_type", "requested_type", "expected_type"),
+    [("pil", "np", "pil"), ("np", "pil", "np"), ("pt", "pil", "pt"), (None, "pil", "pil"), (None, None, "np")],
+)
+def test_multiview_explicit_output_type_precedes_request_default(
+    explicit_type: str | None, requested_type: str | None, expected_type: str
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        get_cosmos3_multiview_post_process_func,
+    )
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    postprocess = get_cosmos3_multiview_post_process_func(SimpleNamespace(model_config={"guardrails": False}))
+    payload = {
+        "payload": {"video": torch.zeros(1, 3, 6, 4, 4)},
+        "metadata": {"multiview": {"cameras": ["front", "rear"], "frames_per_view": 3}},
+    }
+    result = postprocess(
+        payload, output_type=explicit_type, sampling_params=OmniDiffusionSamplingParams(output_type=requested_type)
+    )
+    video = result["payload"]["video"]
+    if expected_type == "pil":
+        assert isinstance(video, list) and isinstance(video[0][0], Image.Image)
+    elif expected_type == "pt":
+        assert isinstance(video, torch.Tensor) and video.shape == (1, 6, 3, 4, 4)
+    else:
+        assert isinstance(video, np.ndarray) and video.shape == (1, 6, 4, 4, 3)

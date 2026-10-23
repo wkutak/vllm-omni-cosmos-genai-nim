@@ -233,7 +233,9 @@ def _tensor_to_shm(
         if created is not None:
             created.append(handle)
         return handle
-    if d2h_stream is not None:
+    # CPU outputs already reside on the host; a second pinned copy only
+    # duplicates the complete video without performing a device transfer.
+    if d2h_stream is not None and tensor.device.type != "cpu":
         # Non-blocking D2H: copy on side stream to pinned CPU memory.
         old_stream = torch.accelerator.current_stream()
         torch.accelerator.set_stream(d2h_stream)

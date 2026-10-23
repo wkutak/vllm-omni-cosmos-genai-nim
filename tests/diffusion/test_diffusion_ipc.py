@@ -456,3 +456,39 @@ def test_pack_value_packs_non_contiguous_large_tensor_values() -> None:
         torch.testing.assert_close(unpacked, tensor)
     finally:
         _cleanup_shm_handle(packed)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("strided", [False, True])
+def test_cpu_tensor_with_d2h_stream_never_allocates_pinned_copy(monkeypatch, dtype, strided) -> None:
+    from typing import cast
+
+    from vllm_omni.diffusion import ipc
+
+    count = _large_numel(dtype)
+    source = torch.arange(count * 2, dtype=torch.float32).to(dtype)[::2]
+    if not strided:
+        source = source.contiguous()
+
+    def forbidden_accelerator_access(*args, **kwargs):
+        pytest.fail("Packing a CPU tensor must not access accelerator streams or allocate a pinned CPU copy")
+
+    monkeypatch.setattr(torch.accelerator, "current_stream", forbidden_accelerator_access)
+    monkeypatch.setattr(torch.accelerator, "set_stream", forbidden_accelerator_access)
+    original_empty = torch.empty
+
+    def no_pinned_empty(*args, pin_memory=False, **kwargs):
+        if pin_memory:
+            pytest.fail("A CPU output must not be duplicated into pinned storage")
+        return original_empty(*args, pin_memory=pin_memory, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", no_pinned_empty)
+    handle = None
+    try:
+        handle = ipc._tensor_to_shm(source, d2h_stream=cast(torch.Stream, object()))
+        actual = ipc._tensor_from_shm(handle)
+        handle = None
+        assert actual.device.type == "cpu" and actual.dtype == dtype
+        torch.testing.assert_close(actual, source, rtol=0, atol=0)
+    finally:
+        _cleanup_shm_handle(handle)
