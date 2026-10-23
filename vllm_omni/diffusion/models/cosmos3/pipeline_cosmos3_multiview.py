@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import math
 import os
+import tempfile
+import weakref
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, ClassVar
@@ -71,6 +73,7 @@ logger = init_logger(__name__)
 # Select the runtime kernel strategy (maskless | triton); both obey
 # the same attention rules.
 COSMOS3_MULTIVIEW_BACKEND_ENV = "VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND"
+COSMOS3_MULTIVIEW_CPU_BUFFER_DIR_KEY = "cosmos3_multiview_cpu_buffer_dir"
 
 # Per-camera frame count when the request supplies none.
 COSMOS3_MULTIVIEW_DEFAULT_NUM_FRAMES = 201
@@ -85,6 +88,25 @@ COSMOS3_MULTIVIEW_DEFAULT_LIDAR_CONDITION_SWEEPS = 1
 # two cannot drift and accidentally trigger shape-specific recompilation.
 COSMOS3_MULTIVIEW_PROMPT_FRAMING_TOKENS = 2
 COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH = DEFAULT_MAX_UND_TOKENS - COSMOS3_MULTIVIEW_PROMPT_FRAMING_TOKENS
+
+
+def _empty_multiview_cpu_buffer(shape: tuple[int, ...], dtype: torch.dtype, buffer_dir: str | None) -> torch.Tensor:
+    """Optionally let the OS reclaim CPU media pages through a temporary file."""
+    if buffer_dir is None:
+        return torch.empty(shape, dtype=dtype, device="cpu")
+    descriptor, filename = tempfile.mkstemp(prefix=f"vllm-omni-cosmos3-{os.getpid()}-", dir=buffer_dir)
+    os.close(descriptor)
+    path = Path(filename)
+    try:
+        tensor = torch.from_file(filename, shared=True, size=math.prod(shape), dtype=dtype).reshape(shape)
+    except (OSError, RuntimeError, ValueError):
+        path.unlink(missing_ok=True)
+        raise
+    # Storage, rather than the returned tensor, owns cleanup: detached tensors,
+    # narrow views and NumPy arrays can retain the mapping after this tensor dies.
+    # Closing the last mapping also completes any NFS deferred unlink.
+    weakref.finalize(tensor.untyped_storage(), path.unlink, missing_ok=True)
+    return tensor
 
 
 def _media_kind(value: Any) -> str:
@@ -412,6 +434,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
     # model on its first real request instead of weakening request validation.
     dummy_run_num_frames: ClassVar[int] = 0
     _encoder_modules: ClassVar[list[str]] = []
+    multiview_cpu_buffer_dir: str | None = None
 
     def predict_noise(self, **kwargs):
         # Resolve branch metadata on the host before entering the transformer.
@@ -438,6 +461,12 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         return combined
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
+        buffer_dir = od_config.additional_config.get(COSMOS3_MULTIVIEW_CPU_BUFFER_DIR_KEY)
+        if buffer_dir is not None and (
+            not isinstance(buffer_dir, str) or not buffer_dir or not Path(buffer_dir).is_dir()
+        ):
+            raise ValueError(f"{COSMOS3_MULTIVIEW_CPU_BUFFER_DIR_KEY} must name an existing directory.")
+        self.multiview_cpu_buffer_dir = buffer_dir
         multiview_config = _validated_multiview_deployment_config(od_config.tf_model_config)
         resolved_backend = self._resolve_attention_backend()
         validate_multiview_parallel_config(
@@ -534,7 +563,9 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         keep_first: bool,
         require_complete: bool = False,
     ) -> torch.Tensor:
-        camera_major = torch.empty((1, 3, len(views) * num_frames, height, width), dtype=self.dtype, device="cpu")
+        camera_major = _empty_multiview_cpu_buffer(
+            (1, 3, len(views) * num_frames, height, width), self.dtype, self.multiview_cpu_buffer_dir
+        )
         for index, view in enumerate(views):
             value = self._view_value(view, field)
             if value is None:
@@ -609,7 +640,9 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 view_shape = decoded_view.shape
                 frames_per_view = view_shape[2]
                 output_shape = (*view_shape[:2], num_views * frames_per_view, *view_shape[3:])
-                decoded_output = torch.empty(output_shape, dtype=decoded_view.dtype, device="cpu")
+                decoded_output = _empty_multiview_cpu_buffer(
+                    output_shape, decoded_view.dtype, self.multiview_cpu_buffer_dir
+                )
             elif decoded_view.shape != view_shape or decoded_view.dtype != decoded_output.dtype:
                 raise ValueError("Cosmos3 multiview VAE decoded camera clips must have matching shapes and dtypes.")
             # Copy each camera before decoding the next: retaining the GPU clips

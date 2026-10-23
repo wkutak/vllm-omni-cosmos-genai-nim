@@ -4790,3 +4790,95 @@ def test_multiview_decodes_only_the_replica_output_owner(
     else:
         assert result.output is None
         assert decoded == []
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_multiview_file_backed_pixels_match_anonymous(tmp_path, dtype) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3_multiview as module
+
+    pipeline = object.__new__(module.Cosmos3MultiviewPipeline)
+    pipeline.dtype = dtype
+    pipeline.multiview_cpu_buffer_dir = None
+    views = [{"control": torch.arange(3 * 5 * 2 * 4).remainder(256).byte().reshape(3, 5, 2, 4)}] * 3
+    expected = pipeline._prepare_camera_major_pixels(
+        views, field="control", height=2, width=4, num_frames=5, keep_first=False
+    )
+    pipeline.multiview_cpu_buffer_dir = str(tmp_path)
+    actual = pipeline._prepare_camera_major_pixels(
+        views, field="control", height=2, width=4, num_frames=5, keep_first=False
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert len(list(tmp_path.iterdir())) == 1
+    assert actual.untyped_storage().filename is not None
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_multiview_file_backed_decode_matches_anonymous(tmp_path, dtype) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3_multiview as module
+
+    pipeline = object.__new__(module.Cosmos3MultiviewPipeline)
+    pipeline._decode_latents = lambda x: x.repeat_interleave(2, dim=2) * 2 + 1
+    latents = torch.arange(3 * 6 * 2 * 4, dtype=dtype).reshape(1, 3, 6, 2, 4)
+    pipeline.multiview_cpu_buffer_dir = None
+    expected = pipeline._decode_multiview_latents(latents, num_views=3, latent_frames_per_view=2)
+    pipeline.multiview_cpu_buffer_dir = str(tmp_path)
+    actual = pipeline._decode_multiview_latents(latents, num_views=3, latent_frames_per_view=2)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert len(list(tmp_path.iterdir())) == 1
+    assert actual.untyped_storage().filename is not None
+
+
+@pytest.mark.parametrize("inference", [False, True])
+def test_multiview_file_backed_buffer_lives_until_last_storage_view(tmp_path, inference) -> None:
+    import gc
+
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3_multiview as module
+
+    with torch.inference_mode(inference):
+        tensor = module._empty_multiview_cpu_buffer((2, 3), torch.float32, str(tmp_path))
+        tensor.fill_(7)
+        detached = tensor.detach()
+        view = detached[:, :1]
+        array = detached.numpy()
+    del tensor, detached
+    gc.collect()
+    assert len(list(tmp_path.iterdir())) == 1
+    assert torch.equal(view, torch.full((2, 1), 7.0))
+    del view
+    gc.collect()
+    assert len(list(tmp_path.iterdir())) == 1
+    np.testing.assert_array_equal(array, np.full((2, 3), 7.0))
+    del array
+    gc.collect()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_multiview_file_backed_allocation_failure_removes_file(tmp_path, monkeypatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3_multiview as module
+
+    def fail_mapping(*args, **kwargs):
+        raise RuntimeError("mapping failed")
+
+    monkeypatch.setattr(torch, "from_file", fail_mapping)
+    with pytest.raises(RuntimeError, match="mapping failed"):
+        module._empty_multiview_cpu_buffer((2, 3), torch.float32, str(tmp_path))
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_multiview_file_backed_option_defaults_to_anonymous(dtype) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3_multiview as module
+
+    tensor = module._empty_multiview_cpu_buffer((2, 3), dtype, None)
+    assert tensor.shape == (2, 3)
+    assert tensor.dtype == dtype
+    assert tensor.untyped_storage().filename is None
+
+
+@pytest.mark.parametrize("value", [False, "", "/nonexistent/cosmos3-media-buffer"])
+def test_multiview_file_backed_directory_is_validated_before_model_loading(value) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3_multiview as module
+
+    config = SimpleNamespace(additional_config={"cosmos3_multiview_cpu_buffer_dir": value})
+    with pytest.raises(ValueError, match="cosmos3_multiview_cpu_buffer_dir"):
+        module.Cosmos3MultiviewPipeline(od_config=config)

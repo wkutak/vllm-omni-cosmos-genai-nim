@@ -185,6 +185,23 @@ owner decodes RGB/LiDAR; other ranks complete denoising without allocating
 camera-sized output buffers. Camera ordering, VAE calls on the output rank and
 numeric LiDAR presentation retain the same contract.
 
+For host-memory-constrained multiview runs, opt in to file-backed normalized
+RGB/WSM and decoded CPU buffers by adding
+`"cosmos3_multiview_cpu_buffer_dir":"/path/to/media-buffers"` alongside the
+precision policy in `additional_config`. Create that directory on a filesystem
+with enough free space before starting workers. Each rank creates unique files;
+this changes storage backing only, preserving per-camera normalization and VAE
+calls. It adds filesystem I/O and does not share preprocessing between ranks.
+The OS can reclaim mapped file pages under memory pressure. Without this option,
+CPU buffers use the same anonymous `torch.empty` allocations.
+
+Files are unlinked when their last tensor/storage view is released, including
+detached and NumPy views. Normal exceptions also release their buffers. Abrupt
+process termination, such as SIGKILL or an OOM kill, can bypass cleanup and leave
+`vllm-omni-cosmos3-*` files. Remove leftovers only after their worker processes
+have exited. Avoid a RAM-backed directory when the aim is to reduce host-memory
+pressure; `TMPDIR` must point to disk if used as the buffer directory.
+
 ## References
 
 - [Video API](../../docs/serving/videos_api.md)
