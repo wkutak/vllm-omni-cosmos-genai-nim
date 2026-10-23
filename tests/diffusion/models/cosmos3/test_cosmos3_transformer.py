@@ -22,11 +22,6 @@ def _single_rank_tensor_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
     """Provide the TP metadata required by vLLM parallel linear layers."""
     from vllm.model_executor import parameter
     from vllm.model_executor.layers import linear
-    from vllm.model_executor.models import utils as model_utils
-
-    # vLLM keys this cache by id(model), which Python can reuse after a
-    # preceding test releases its temporary model. Keep fixture models local.
-    monkeypatch.setattr(model_utils, "_model_to_pp_missing_layer_names", {})
 
     from vllm_omni.diffusion.models.cosmos3 import (
         transformer_cosmos3,
@@ -843,7 +838,8 @@ def test_edge_validates_required_relu2_weights() -> None:
     model.validate_loaded_weights(missing_k_norm)
 
 
-def test_edge_weight_validation_skips_pp_missing_layers() -> None:
+def test_edge_weight_validation_skips_pp_missing_layers(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm.model_executor.models import utils as model_utils
     from vllm.model_executor.models.utils import PPMissingLayer
 
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_edge import (
@@ -866,6 +862,10 @@ def test_edge_weight_validation_skips_pp_missing_layers() -> None:
 
     first_stage = _make_stage(first=True)
     last_stage = _make_stage(first=False)
+
+    # Simulate a stale cache lookup without mutating vLLM's process-global
+    # id-keyed cache, which would leak the same failure into later tests.
+    monkeypatch.setattr(model_utils, "get_pp_missing_layer_names", lambda _model: [])
 
     first_loaded = {
         f"transformer.language_model.layers.{i}.{suffix}.weight"
