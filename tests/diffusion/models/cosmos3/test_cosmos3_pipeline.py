@@ -4815,7 +4815,8 @@ def test_multiview_postprocess_honors_request_output_type(output_type) -> None:
 
 
 @pytest.mark.parametrize("output_type", ["np", "pil"])
-def test_multiview_cpu_worker_transport_engine_route_releases_raw_video(monkeypatch, output_type) -> None:
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_multiview_cpu_worker_transport_engine_route_releases_raw_video(monkeypatch, output_type, dtype) -> None:
     import gc
     from multiprocessing import shared_memory
     from typing import cast
@@ -4845,7 +4846,7 @@ def test_multiview_cpu_worker_transport_engine_route_releases_raw_video(monkeypa
     lidar = torch.arange(36, dtype=torch.float32).reshape(1, 3, 2, 3, 2)
     previous = None
     for _ in range(2):
-        raw = source.clone()
+        raw = source.to(dtype=dtype).clone()
         worker_raw = weakref.ref(raw)
         worker_storage = weakref.ref(raw.untyped_storage())
         output = DiffusionOutput(
